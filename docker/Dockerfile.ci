@@ -14,11 +14,11 @@ RUN apt-get update && \
 
 # Install vLLM wheel for the specific commit
 # URL format: https://wheels.vllm.ai/<commit_hash>/
-# Current vLLM wheel commit: ec12d39d44739bee408ec1473acc09e75daf1a5d
+# Current vLLM wheel commit: 2d5be1dd5ce2e44dfea53ea03ff61143da5137eb
 # Note: --prerelease=allow is required because nightly/commit wheels use
 # pre-release version numbers (e.g. 2.10.0.dev...) which uv ignores by default,
 # causing it to fall back to the older stable release from PyPI.
-RUN uv pip install --system --upgrade --force-reinstall --prerelease=allow vllm --extra-index-url https://wheels.vllm.ai/ec12d39d44739bee408ec1473acc09e75daf1a5d
+RUN uv pip install --system --upgrade --force-reinstall --prerelease=allow vllm --extra-index-url https://wheels.vllm.ai/2d5be1dd5ce2e44dfea53ea03ff61143da5137eb
 
 # # Keep flashinfer runtime packages in version sync.
 # # We derive the version from installed flashinfer (pulled by vllm)

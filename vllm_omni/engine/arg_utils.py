@@ -109,7 +109,6 @@ class OmniEngineArgs(EngineArgs):
         self._ensure_omni_models_registered()
 
         # Keep compatibility when async args are constructed from partial payloads.
-        language_model_only = getattr(self, "language_model_only", False)
         limit_mm_per_prompt = getattr(self, "limit_mm_per_prompt", {})
         enable_mm_embeds = getattr(self, "enable_mm_embeds", False)
         interleave_mm_strings = getattr(self, "interleave_mm_strings", False)
@@ -164,7 +163,6 @@ class OmniEngineArgs(EngineArgs):
             skip_tokenizer_init=self.skip_tokenizer_init,
             enable_prompt_embeds=self.enable_prompt_embeds,
             served_model_name=self.served_model_name,
-            language_model_only=language_model_only,
             limit_mm_per_prompt=limit_mm_per_prompt,
             enable_mm_embeds=enable_mm_embeds,
             interleave_mm_strings=interleave_mm_strings,
@@ -267,7 +265,6 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
         self._ensure_omni_models_registered()
 
         # Keep compatibility when async args are constructed from partial payloads.
-        language_model_only = getattr(self, "language_model_only", False)
         limit_mm_per_prompt = getattr(self, "limit_mm_per_prompt", {})
         enable_mm_embeds = getattr(self, "enable_mm_embeds", False)
         interleave_mm_strings = getattr(self, "interleave_mm_strings", False)
@@ -322,7 +319,6 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
             skip_tokenizer_init=self.skip_tokenizer_init,
             enable_prompt_embeds=self.enable_prompt_embeds,
             served_model_name=self.served_model_name,
-            language_model_only=language_model_only,
             limit_mm_per_prompt=limit_mm_per_prompt,
             enable_mm_embeds=enable_mm_embeds,
             interleave_mm_strings=interleave_mm_strings,

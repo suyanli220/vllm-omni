@@ -205,17 +205,18 @@ class OmniRequestState(RequestState):
                 new_token_ids = self.detokenizer.output_token_ids[self.sent_tokens_offset :]
                 self.sent_tokens_offset = len(self.detokenizer.output_token_ids)
 
-        request_id = self.request_id
+        external_req_id = self.external_req_id
         output = self._new_completion_output(new_token_ids, finish_reason, stop_reason, routed_experts)
 
         if self.parent_req is None:
             outputs = [output]
         else:
-            request_id, outputs, finished = self.parent_req.get_outputs(request_id, output)
+            outputs, finished = self.parent_req.get_outputs(self.request_id, output)
             if not outputs:
                 return None
+            external_req_id = self.parent_req.external_req_id
 
-        return self._new_request_output(request_id, outputs, finished, kv_transfer_params)
+        return self._new_request_output(external_req_id, outputs, finished, kv_transfer_params)
 
     def _new_completion_output(
         self,
