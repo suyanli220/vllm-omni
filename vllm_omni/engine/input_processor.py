@@ -1,6 +1,6 @@
 import time
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import torch
@@ -9,7 +9,7 @@ from vllm.inputs import ProcessorInputs, PromptType
 from vllm.inputs.parse import split_enc_dec_inputs
 from vllm.logger import init_logger
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
-from vllm.multimodal.inputs import MultiModalFeatureSpec, MultiModalUUIDDict
+from vllm.multimodal.inputs import MultiModalFeatureSpec
 
 try:
     from vllm.multimodal.processing import set_request_id
@@ -22,8 +22,8 @@ except ImportError:  # vllm without set_request_id (older releases)
 
 
 from vllm.multimodal.utils import argsort_mm_positions
-from vllm.platforms import current_platform
 from vllm.pooling_params import PoolingParams
+from vllm.renderers import BaseRenderer
 from vllm.renderers.inputs import DictPrompt, TokPrompt
 from vllm.sampling_params import SamplingParams
 from vllm.tasks import SupportedTask
@@ -41,6 +41,35 @@ from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.lora.request import LoRARequest
 
 logger = init_logger(__name__)
+
+_OMNI_EXTRA_KEYS = (
+    "additional_information",
+    "prompt_embeds",
+    "negative_prompt",
+    "negative_prompt_embeds",
+)
+
+
+def reinject_omni_fields(
+    results: list[ProcessorInputs],
+    original_prompts: list[dict],
+) -> None:
+    """Re-inject omni-specific fields that the upstream renderer discards.
+
+    The upstream renderer's ``process_for_engine`` creates new dicts that only
+    copy standard vLLM fields (prompt_token_ids, multi_modal_data, …).
+    Omni-specific fields such as ``additional_information`` and
+    ``prompt_embeds`` are silently dropped.  This helper copies them back from
+    the *original* parsed prompts into the renderer outputs so they survive
+    into ``OmniInputProcessor.process_inputs()``.
+    """
+    for result, orig in zip(results, original_prompts):
+        if not isinstance(orig, dict):
+            continue
+        for key in _OMNI_EXTRA_KEYS:
+            val = orig.get(key)
+            if val is not None and key not in result:
+                result[key] = val
 
 
 class OmniInputProcessor(InputProcessor):
@@ -88,9 +117,11 @@ class OmniInputProcessor(InputProcessor):
     def __init__(
         self,
         vllm_config: VllmConfig,
+        renderer: BaseRenderer | None = None,
+        *,
         mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
     ):
-        super().__init__(vllm_config, mm_registry=mm_registry)
+        super().__init__(vllm_config, renderer=renderer, mm_registry=mm_registry)
         self.input_preprocessor = OmniInputPreprocessor(
             vllm_config=vllm_config,
             renderer=self.renderer,
@@ -150,48 +181,24 @@ class OmniInputProcessor(InputProcessor):
         if data_parallel_rank is not None and not (0 <= data_parallel_rank < num_ranks):
             raise ValueError(f"data_parallel_rank {data_parallel_rank} is out of range [0, {num_ranks}).")
 
-        if arrival_time is None:
-            arrival_time = time.time()
-
-        # Optionally generate multimodal hash overrides to avoid hashing
-        # multimodal data items by their content as their identifiers.
-
-        # NOTE: when users explicitly turn off BOTH prefix caching and input
-        # processing caching, no multimodal features or embeddings will be
-        # reused across requests, therefore identifying multimodal data items
-        # by their content is no longer necessary, and we create uuids with
-        # request id-modality-index as multimodal hash overrides.
-        if (
-            self.model_config.multimodal_config
-            and self.model_config.multimodal_config.mm_processor_cache_gb == 0
-            and not self.cache_config.enable_prefix_caching
-        ):
-            mm_uuids = self._maybe_build_mm_uuids(request_id, prompt)
+        # Short-circuit for prompts already processed by the renderer
+        # (they carry a "type" key).  Raw prompts must still go through the
+        # omni preprocessor which preserves additional_information, etc.
+        if isinstance(prompt, dict) and "type" in prompt:
+            if arrival_time is None:
+                arrival_time = prompt.get("arrival_time", time.time())
+            processed_inputs: ProcessorInputs = prompt  # type: ignore[assignment]
         else:
-            # Otherwise, use user-provided uuids as multimodal hash overrides
-            # if provided.
-            self._validate_mm_uuids(prompt)
-            if isinstance(prompt, dict):
-                mm_uuids = cast(MultiModalUUIDDict | None, prompt.get("multi_modal_uuids"))
-            else:
-                mm_uuids = None
+            if arrival_time is None:
+                arrival_time = time.time()
 
-        # Process inputs, which includes:
-        # 1. Tokenize text prompt, with LoRA request if one exists.
-        # 2. For multimodal models with a merged preprocessor, preprocess
-        #   multimodal data and expand prompt token ids accordingly.
-        with set_request_id(request_id), set_default_torch_num_threads():
-            processed_inputs: ProcessorInputs = self.input_preprocessor.preprocess(
-                prompt,
-                tokenization_kwargs=tokenization_kwargs,
-                mm_uuids=mm_uuids,
-            )
+            with set_request_id(request_id), set_default_torch_num_threads():
+                processed_inputs = self.input_preprocessor.preprocess(
+                    prompt,
+                    tokenization_kwargs=tokenization_kwargs,
+                )
 
-        current_platform.validate_request(
-            prompt=prompt,
-            params=params,
-            processed_inputs=processed_inputs,
-        )
+        self._platform_validate_request(processed_inputs, params)
 
         eos_token_id = self.renderer.get_eos_token_id()
 

@@ -259,8 +259,10 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
     def __init__(
         self,
         tokenizer: TokenizerLike | None,
+        *,
         log_stats: bool,
         stream_interval: int = 1,
+        tracing_enabled: bool = False,
         engine_core_output_type: str | None = None,
     ):
         """Initialize the multimodal output processor.
@@ -273,7 +275,12 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 (e.g., "image", "audio", "latents"). Used to route outputs
                 to appropriate processors. If None, output type is inferred.
         """
-        super().__init__(tokenizer=tokenizer, log_stats=log_stats, stream_interval=stream_interval)
+        super().__init__(
+            tokenizer=tokenizer,
+            log_stats=log_stats,
+            stream_interval=stream_interval,
+            tracing_enabled=tracing_enabled,
+        )
         self.output_handlers: dict[str, Callable[[EngineCoreOutput], None]] = {}
         self._reqid_to_mm_type: dict[str, str] = {}
         self.engine_core_output_type = engine_core_output_type

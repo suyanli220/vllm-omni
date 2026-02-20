@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import cloudpickle
@@ -8,9 +8,11 @@ from tqdm import tqdm
 # External library imports (vLLM)
 from vllm.config import CompilationConfig, StructuredOutputsConfig, is_init_field
 from vllm.entrypoints.llm import LLM
+from vllm.inputs import ProcessorInputs, PromptType
 from vllm.logger import init_logger
 from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.plugins.io_processors import get_io_processor
+from vllm.renderers.inputs.preprocess import parse_model_prompt
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.counter import Counter
 from vllm.v1.engine.llm_engine import LLMEngine
@@ -19,7 +21,7 @@ from vllm_omni.distributed.omni_connectors import initialize_orchestrator_connec
 
 # Internal imports (our code)
 from vllm_omni.engine.arg_utils import OmniEngineArgs
-from vllm_omni.engine.input_processor import OmniInputProcessor
+from vllm_omni.engine.input_processor import OmniInputProcessor, reinject_omni_fields
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.entrypoints.utils import (
     load_stage_configs_from_model,
@@ -181,6 +183,27 @@ class OmniLLM(LLM):
         self.io_processor = get_io_processor(self.llm_engine.vllm_config, io_processor_plugin)
         self.model_config = self.llm_engine.model_config
         self.input_processor = self.llm_engine.input_processor
+
+    # ------------------------------------------------------------------
+    # Override upstream _preprocess_cmpl so that omni-specific fields
+    # (additional_information, prompt_embeds, …) survive the renderer's
+    # process_for_engine step which only copies standard vLLM keys.
+    # ------------------------------------------------------------------
+
+    def _preprocess_cmpl(
+        self,
+        prompts: Sequence[PromptType],
+        tokenization_kwargs: dict[str, Any] | None = None,
+    ) -> Sequence[ProcessorInputs]:
+        renderer = self.renderer
+        model_config = self.model_config
+
+        parsed_prompts = [parse_model_prompt(model_config, prompt) for prompt in prompts]
+        tok_params = renderer.default_cmpl_tok_params.with_kwargs(**(tokenization_kwargs or {}))
+        results = renderer.render_cmpl(parsed_prompts, tok_params)
+
+        reinject_omni_fields(results, parsed_prompts)
+        return results
 
     def close(self) -> None:
         """Close resources.

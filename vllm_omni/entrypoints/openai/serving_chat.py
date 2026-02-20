@@ -371,6 +371,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             default_template_content_format,
         ).with_defaults(default_template_kwargs)
 
+        # OMNI: When use_audio_in_video=True, the qwen2_5_omni_thinker mm
+        # processor asserts that audio items are present alongside video items
+        # (inside render_chat_async).  We must inject audio_url items into the
+        # messages BEFORE calling render_chat_async so the mm processor can
+        # count them correctly during tokenisation.
+        mm_proc_kw = getattr(request, "mm_processor_kwargs", None) or {}
+        if mm_proc_kw.get("use_audio_in_video", False):
+            messages = await self._inject_audio_from_video_urls(messages)
+
         (conversation,), (engine_prompt,) = await renderer.render_chat_async(
             [messages],
             chat_params,
@@ -379,28 +388,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 k: v for k in ("mm_processor_kwargs", "cache_salt") if (v := getattr(request, k, None)) is not None
             },
         )
-
-        # OMNI: When use_audio_in_video=True, the upstream renderer does not
-        # extract audio from video.  We do it here after rendering so that the
-        # audio data is present in multi_modal_data before the engine processes
-        # the request.
-        mm_proc_kw = getattr(request, "mm_processor_kwargs", None) or {}
-        if mm_proc_kw.get("use_audio_in_video", False) and isinstance(engine_prompt, dict):
-            mm_data = engine_prompt.get("multi_modal_data")
-            if mm_data is not None and "video" in mm_data and "audio" not in mm_data:
-                from vllm_omni.entrypoints.chat_utils import extract_audio_from_video_async
-
-                video_urls: list[str] = []
-                for msg in messages:
-                    for part in msg.get("content") or []:
-                        if isinstance(part, dict) and part.get("type") == "video_url":
-                            url = part.get("video_url", {}).get("url")
-                            if url:
-                                video_urls.append(url)
-
-                if video_urls:
-                    audios = await asyncio.gather(*(extract_audio_from_video_async(u) for u in video_urls))
-                    engine_prompt.setdefault("multi_modal_data", {})["audio"] = list(audios)
 
         tokenizer = renderer.get_tokenizer()
 
@@ -421,6 +408,95 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             )
 
         return conversation, [engine_prompt]
+
+    async def _inject_audio_from_video_urls(
+        self,
+        messages: list[ChatCompletionMessageParam],
+    ) -> list[ChatCompletionMessageParam]:
+        """Pre-extract audio from video URLs and inject as audio_url content items.
+
+        When use_audio_in_video=True, the qwen2_5_omni_thinker multimodal
+        processor requires that the number of audio items equals the number of
+        video items (it subtracts mm_counts["video"] from mm_counts["audio"]).
+        The client only sends video_url items; this method adds the matching
+        audio_url items on the server side before the renderer processes them.
+        """
+        import io
+
+        from vllm_omni.entrypoints.chat_utils import extract_audio_from_video_async
+
+        new_messages: list[ChatCompletionMessageParam] = []
+        for msg in messages:
+            content = msg.get("content") if isinstance(msg, dict) else getattr(msg, "content", None)
+            if not isinstance(content, list):
+                new_messages.append(msg)
+                continue
+
+            video_urls = [
+                part.get("video_url", {}).get("url")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "video_url" and part.get("video_url", {}).get("url")
+            ]
+
+            if not video_urls:
+                new_messages.append(msg)
+                continue
+
+            audios = await asyncio.gather(*(extract_audio_from_video_async(u) for u in video_urls))
+
+            audio_items: list[dict] = []
+            for audio_array, sample_rate in audios:
+                buf = io.BytesIO()
+                if soundfile is not None:
+                    soundfile.write(buf, audio_array, samplerate=int(sample_rate), format="WAV")
+                else:
+                    import struct
+
+                    import numpy as np
+
+                    audio_np = np.asarray(audio_array, dtype=np.float32)
+                    sr = int(sample_rate)
+                    num_channels = 1
+                    bits_per_sample = 32
+                    num_frames = len(audio_np)
+                    data_size = num_frames * num_channels * (bits_per_sample // 8)
+                    # Write minimal RIFF/WAV header
+                    buf.write(b"RIFF")
+                    buf.write(struct.pack("<I", 36 + data_size))
+                    buf.write(b"WAVE")
+                    buf.write(b"fmt ")
+                    buf.write(
+                        struct.pack(
+                            "<IHHIIHH",
+                            16,
+                            3,
+                            num_channels,
+                            sr,
+                            sr * num_channels * (bits_per_sample // 8),
+                            num_channels * (bits_per_sample // 8),
+                            bits_per_sample,
+                        )
+                    )
+                    buf.write(b"data")
+                    buf.write(struct.pack("<I", data_size))
+                    buf.write(audio_np.tobytes())
+
+                audio_b64 = base64.b64encode(buf.getvalue()).decode()
+                audio_items.append(
+                    {
+                        "type": "audio_url",
+                        "audio_url": {"url": f"data:audio/wav;base64,{audio_b64}"},
+                    }
+                )
+
+            new_content = list(content) + audio_items
+            if isinstance(msg, dict):
+                new_msg = {**msg, "content": new_content}
+            else:
+                new_msg = msg.model_copy(update={"content": new_content})
+            new_messages.append(new_msg)
+
+        return new_messages
 
     def _to_sampling_params_list(self, sampling_params_list: list[dict]) -> list[SamplingParams]:
         final_sampling_params_list = []
