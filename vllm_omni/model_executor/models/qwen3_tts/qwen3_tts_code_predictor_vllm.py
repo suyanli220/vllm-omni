@@ -143,6 +143,7 @@ class _LocalPredictorKVCache:
                 cursor += 1
 
         max_seq_len = int(seq_lens_i32[:num_reqs].max().item())
+        max_query_len = int(query_lens_i32[:num_reqs].max().item())
         query_start_loc_gpu = qsl.to(device=self.device)
         seq_lens_gpu = seq_lens_i32.to(device=self.device)
         block_table = self._block_table[:num_reqs].contiguous()
@@ -154,6 +155,7 @@ class _LocalPredictorKVCache:
             num_tokens=num_tokens,
             query_start_loc_gpu=query_start_loc_gpu,
             query_start_loc_cpu=qsl,
+            max_query_len=max_query_len,
             seq_lens=seq_lens_gpu,
             max_seq_len=max_seq_len,
             block_tables=[block_table],

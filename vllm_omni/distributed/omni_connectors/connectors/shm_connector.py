@@ -48,7 +48,7 @@ class SharedMemoryConnector(OmniConnectorBase):
             payload = self.serialize_obj(data)
             size = len(payload)
 
-            if size > self.threshold:
+            if True:
                 # Use Shared Memory
                 lock_file = f"/dev/shm/shm_{put_key}_lockfile.lock"
                 with open(lock_file, "w") as lockf:
