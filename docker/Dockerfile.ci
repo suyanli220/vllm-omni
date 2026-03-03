@@ -21,8 +21,8 @@ RUN apt-get update && \
 RUN uv pip install --system --upgrade --force-reinstall --prerelease=allow vllm --extra-index-url https://wheels.vllm.ai/a60985b07eaf0fefa4c353ad2309b745707591ed
 
 RUN uv pip install --system --no-cache-dir ".[dev]"
+RUN uv pip install --system --upgrade "flashinfer-cubin==0.6.4"
+
 RUN ln -sf /usr/bin/python3 /usr/bin/python
-RUN FLASHINFER_VERSION=$(python -c "from importlib.metadata import version; print(version('flashinfer'))") && \
-    uv pip install --system --upgrade "flashinfer-cubin==${FLASHINFER_VERSION}"
 
 ENTRYPOINT []
