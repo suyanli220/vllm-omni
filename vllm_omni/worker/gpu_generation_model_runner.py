@@ -265,9 +265,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
-        # When spec decode is enabled, defer connector finalization
-        # (wait_for_save + clear metadata) until after draft model runs.
-        defer_kv_connector_finalize = self.speculative_config is not None
+        # When spec decode is enabled, defer clearing KV connector metadata
+        # until after draft model runs in sample_tokens.
+        clear_kv_metadata = self.speculative_config is None
         with (
             set_forward_context(
                 attn_metadata,
@@ -282,7 +282,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             record_function_or_nullcontext("Forward"),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
-                defer_finalize=defer_kv_connector_finalize,
+                clear_metadata=clear_kv_metadata,
             ) as kv_connector_output,
         ):
             outputs = self._run_generation_model(
