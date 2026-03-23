@@ -312,31 +312,31 @@ def main(args):
         seed=SEED,
     )
 
-    talker_sampling_params = SamplingParams(
-        temperature=0.9,
-        top_k=50,
-        max_tokens=4096,
-        seed=SEED,
-        detokenize=False,
-        repetition_penalty=1.05,
-        stop_token_ids=[2150],  # TALKER_CODEC_EOS_TOKEN_ID
-    )
+    # talker_sampling_params = SamplingParams(
+    #     temperature=0.9,
+    #     top_k=50,
+    #     max_tokens=4096,
+    #     seed=SEED,
+    #     detokenize=False,
+    #     repetition_penalty=1.05,
+    #     stop_token_ids=[2150],  # TALKER_CODEC_EOS_TOKEN_ID
+    # )
 
-    # Sampling parameters for Code2Wav stage (audio generation)
-    code2wav_sampling_params = SamplingParams(
-        temperature=0.0,
-        top_p=1.0,
-        top_k=-1,
-        max_tokens=4096 * 16,
-        seed=SEED,
-        detokenize=True,
-        repetition_penalty=1.1,
-    )
+    # # Sampling parameters for Code2Wav stage (audio generation)
+    # code2wav_sampling_params = SamplingParams(
+    #     temperature=0.0,
+    #     top_p=1.0,
+    #     top_k=-1,
+    #     max_tokens=4096 * 16,
+    #     seed=SEED,
+    #     detokenize=True,
+    #     repetition_penalty=1.1,
+    # )
 
     sampling_params_list = [
         thinker_sampling_params,
-        talker_sampling_params,  # code predictor is integrated into talker for Qwen3 Omni
-        code2wav_sampling_params,
+        # talker_sampling_params,  # code predictor is integrated into talker for Qwen3 Omni
+        # code2wav_sampling_params,
     ]
 
     if args.txt_prompts is None:

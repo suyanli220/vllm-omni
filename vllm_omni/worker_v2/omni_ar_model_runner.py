@@ -32,8 +32,13 @@ class OmniARModelRunner(OmniGPUModelRunner):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
+        self.kv_transfer_manager: OmniKVTransferManager | None = None
         self._kv_extracted_req_ids: list[str] | None = None
+
+    def _ensure_kv_transfer_manager(self) -> OmniKVTransferManager:
+        if self.kv_transfer_manager is None:
+            self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
+        return self.kv_transfer_manager
 
     # ------------------------------------------------------------------
     # execute_model: KV transfer pre-hook + delegate to super
@@ -47,7 +52,8 @@ class OmniARModelRunner(OmniGPUModelRunner):
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
     ) -> Any:
-        self._handle_kv_transfer_pre(scheduler_output)
+        if not dummy_run:
+            self._handle_kv_transfer_pre(scheduler_output)
         return super().execute_model(
             scheduler_output,
             intermediate_tensors,
@@ -82,9 +88,18 @@ class OmniARModelRunner(OmniGPUModelRunner):
             self.postprocess(input_batch, sampled, num_sampled, num_rejected)
             return None
 
-        # --- Omni: post-process model output ---
+        # --- Omni: reconstruct raw model output and post-process ---
+        # The forward wrapper stored auxiliary data (e.g.
+        # captured_layer_dict) on _last_aux_output while returning only
+        # the tensor to the base runner.  Re-assemble the tuple here so
+        # make_omni_output can produce a proper OmniOutput.
+        aux = self._last_aux_output
+        self._last_aux_output = None
+        raw_output: Any = hidden_states
+        if aux is not None:
+            raw_output = (hidden_states, aux)
         text_hidden, multimodal_outputs = self.model_state.postprocess_model_output(
-            hidden_states, input_batch, self.req_states
+            raw_output, input_batch, self.req_states
         )
 
         # --- Standard v2 sampling ---
@@ -213,7 +228,14 @@ class OmniARModelRunner(OmniGPUModelRunner):
 
     def _handle_kv_transfer_pre(self, scheduler_output: SchedulerOutput) -> None:
         finished: dict = getattr(scheduler_output, "finished_requests_needing_kv_transfer", {})
-        if finished and hasattr(self.model, "get_kv_transfer_metadata"):
+        if not finished:
+            return
+
+        kv_caches = getattr(self, "kv_caches", None)
+        if kv_caches is None:
+            return
+
+        if hasattr(self.model, "get_kv_transfer_metadata"):
             for req_id, data in finished.items():
                 try:
                     meta = self.model.get_kv_transfer_metadata(req_id)
@@ -227,9 +249,11 @@ class OmniARModelRunner(OmniGPUModelRunner):
                         req_id,
                         exc_info=True,
                     )
-        self._kv_extracted_req_ids = self.kv_transfer_manager.handle_finished_requests_kv_transfer(
+
+        mgr = self._ensure_kv_transfer_manager()
+        self._kv_extracted_req_ids = mgr.handle_finished_requests_kv_transfer(
             finished_reqs=finished,
-            kv_caches=self.kv_caches,
+            kv_caches=kv_caches,
             block_size=self.cache_config.block_size,
             cache_dtype=str(self.cache_config.cache_dtype),
         )

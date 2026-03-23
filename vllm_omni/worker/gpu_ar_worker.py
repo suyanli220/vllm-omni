@@ -18,6 +18,8 @@ from vllm_omni.worker.mixins import OmniWorkerMixin
 
 logger = init_logger(__name__)
 
+VLLM_OMNI_USE_V2_RUNNER = bool(int(os.environ.get("VLLM_OMNI_USE_V2_RUNNER", "0")))
+
 
 class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
     """GPU worker for autoregressive omni model stages.
@@ -48,17 +50,17 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
                 # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
                 self.local_rank += dp_local_rank * tp_pp_world_size
-                assert self.local_rank < torch.accelerator.device_count(), (
+                assert self.local_rank < torch.cuda.device_count(), (
                     f"DP adjusted local rank {self.local_rank} is out of bounds. "
                 )
-                visible_device_count = torch.accelerator.device_count() if torch.cuda.is_available() else 0
+                visible_device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
                 assert self.parallel_config.local_world_size <= visible_device_count, (
                     f"local_world_size ({self.parallel_config.local_world_size}) must "
                     f"be less than or equal to the number of visible devices "
                     f"({visible_device_count})."
                 )
             self.device = torch.device(f"cuda:{self.local_rank}")
-            torch.accelerator.set_device_index(self.device)
+            current_platform.set_device(self.device)
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 
@@ -79,7 +81,7 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
 
             # Now take memory snapshot after NCCL is initialized
             gc.collect()
-            torch.accelerator.empty_cache()
+            torch.cuda.empty_cache()
 
             # take current memory snapshot
             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
@@ -93,13 +95,16 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
         init_workspace_manager(self.device, num_ubatches)
 
-        if self.use_v2_model_runner:
-            # OMNI: v2 model runner does not yet include omni hooks.
-            logger.warning("OMNI GPUARWorker forces v1 model runner for omni hooks.")
-            self.use_v2_model_runner = False
+        if VLLM_OMNI_USE_V2_RUNNER or self.use_v2_model_runner:
+            from vllm_omni.worker_v2.omni_ar_model_runner import (
+                OmniARModelRunner,
+            )
 
-        # Construct the model runner
-        self.model_runner = GPUARModelRunner(self.vllm_config, self.device)
+            logger.info("Using MR v2 OmniARModelRunner for omni AR stage.")
+            self.use_v2_model_runner = True
+            self.model_runner = OmniARModelRunner(self.vllm_config, self.device)
+        else:
+            self.model_runner = GPUARModelRunner(self.vllm_config, self.device)
 
         if self.rank == 0:
             # If usage stat is enabled, collect relevant info.

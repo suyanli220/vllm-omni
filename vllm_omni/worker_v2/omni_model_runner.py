@@ -2,10 +2,19 @@
 
 Injects ``OmniModelState`` via ``load_model`` and adds a
 ``finish_requests`` hook to clean up the intermediate buffer.
+
+Key integration detail: Omni models (e.g. Qwen3-Omni Thinker) return a
+tuple ``(text_hidden_states, captured_layer_dict)`` from ``forward()``.
+The v2 ``GPUModelRunner`` expects a plain tensor.  We wrap the model's
+``forward`` to intercept the tuple, store the auxiliary data (e.g.
+``captured_layer_dict``) on ``_last_aux_output``, and return only the
+tensor.  The aux data is then recombined with the tensor in
+``OmniARModelRunner.sample_tokens`` to build the ``OmniOutput``.
 """
 
 from __future__ import annotations
 
+import functools
 from typing import Any
 
 import torch
@@ -23,10 +32,38 @@ class OmniGPUModelRunner(GPUModelRunner):
     """Thin layer over v2 ``GPUModelRunner`` for Omni lifecycle hooks."""
 
     model_state: OmniModelState
+    _last_aux_output: Any
 
     def load_model(self, *args: Any, **kwargs: Any) -> None:
         super().load_model(*args, **kwargs)
+        self._last_aux_output = None
         self.model_state = init_omni_model_state(self.vllm_config, self.model, self.encoder_cache, self.device)
+        if hasattr(self.model, "make_omni_output"):
+            self._wrap_model_forward()
+
+    def _wrap_model_forward(self) -> None:
+        """Wrap ``model.forward`` to intercept tuple returns.
+
+        Stores the second element on ``self._last_aux_output`` and
+        returns only the first (a tensor), making the model compatible
+        with the v2 runner's tensor-only expectation and CUDA graph
+        capture.
+        """
+        original_forward = self.model.forward
+        runner = self
+
+        @functools.wraps(original_forward)
+        def _wrapped(**kwargs: Any) -> Any:
+            output = original_forward(**kwargs)
+            if isinstance(output, tuple) and len(output) == 2:
+                first, second = output
+                if isinstance(first, torch.Tensor):
+                    runner._last_aux_output = second
+                    return first
+            runner._last_aux_output = None
+            return output
+
+        self.model.forward = _wrapped  # type: ignore[method-assign]
 
     # ------------------------------------------------------------------
     # Request lifecycle: clean up intermediate buffer on finish
@@ -41,32 +78,3 @@ class OmniGPUModelRunner(GPUModelRunner):
             if idx is not None:
                 self.model_state.remove_request(idx)
         super().finish_requests(scheduler_output)
-
-    # ------------------------------------------------------------------
-    # Output intercept: wrap non-Tensor hidden_states → OmniOutput
-    # ------------------------------------------------------------------
-
-    def execute_model(
-        self,
-        scheduler_output: SchedulerOutput,
-        intermediate_tensors: Any | None = None,
-        dummy_run: bool = False,
-        skip_attn_for_dummy_run: bool = False,
-    ) -> Any:
-        result = super().execute_model(
-            scheduler_output,
-            intermediate_tensors,
-            dummy_run=dummy_run,
-            skip_attn_for_dummy_run=skip_attn_for_dummy_run,
-        )
-        if self.execute_model_state is not None:
-            hs = self.execute_model_state.hidden_states
-            if not isinstance(hs, torch.Tensor) and hasattr(self.model, "make_omni_output"):
-                buffer_list = self.model_state.intermediate_buffer.gather(self.execute_model_state.input_batch)
-                omni_output = self.model.make_omni_output(
-                    hs,
-                    model_intermediate_buffer=buffer_list,
-                    runtime_additional_information=buffer_list,
-                )
-                self.execute_model_state = self.execute_model_state._replace(hidden_states=omni_output)
-        return result
