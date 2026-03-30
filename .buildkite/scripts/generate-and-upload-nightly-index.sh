@@ -51,8 +51,8 @@ $PYTHON .buildkite/scripts/generate-nightly-index.py \
 echo "Uploading indices to $S3_COMMIT_PREFIX"
 aws s3 cp --recursive "$INDICES_OUTPUT_DIR/" "$S3_COMMIT_PREFIX"
 
-# copy to /omni/nightly/ only on main branch with NIGHTLY=1
-if [[ "$BUILDKITE_BRANCH" == "main" && "$BUILDKITE_PULL_REQUEST" == "false" && "${NIGHTLY:-}" == "1" ]]; then
+# copy to /omni/nightly/ when NIGHTLY=1
+if [[ "${NIGHTLY:-}" == "1" ]]; then
     echo "Uploading indices to overwrite /omni/nightly/"
     aws s3 cp --recursive "$INDICES_OUTPUT_DIR/" "s3://$BUCKET/omni/nightly/"
 fi
