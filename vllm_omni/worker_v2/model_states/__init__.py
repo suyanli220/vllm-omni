@@ -22,6 +22,8 @@ _OMNI_ARCHITECTURES: set[str] = {
     "MammothModa2ForConditionalGeneration",
     "MiMoAudioForConditionalGeneration",
     "MammothModa2ARForConditionalGeneration",
+    "Qwen3TTSTalkerForConditionalGeneration",
+    "Qwen3TTSCode2Wav",
 }
 
 

@@ -64,6 +64,8 @@ def test_omni_architectures_set_contains_expected():
         "MammothModa2ForConditionalGeneration",
         "MiMoAudioForConditionalGeneration",
         "MammothModa2ARForConditionalGeneration",
+        "Qwen3TTSTalkerForConditionalGeneration",
+        "Qwen3TTSCode2Wav",
     }
     assert _OMNI_ARCHITECTURES == expected
 
