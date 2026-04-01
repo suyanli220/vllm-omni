@@ -30,7 +30,7 @@ TEST_IMAGE_NAME = "qwen-bear.png"
 # ---------------------------------------------------------------------------
 
 qwen_image_edit_server_params = [OmniServerParams(model="Qwen/Qwen-Image-Edit")]
-qwen_image_edit_2509_server_params = [OmniServerParams(model="Qwen/Qwen-Image-Edit-2509")]
+qwen_image_layered_server_params = [OmniServerParams(model="Qwen/Qwen-Image-Layered")]
 
 
 # ---------------------------------------------------------------------------
@@ -145,16 +145,20 @@ def test_api_calls_003(): ...
 
 
 # ---------------------------------------------------------------------------
-# Multi-Image Editing (Qwen-Image-Edit-2509)
+# Layered Image Generation (Qwen-Image-Layered)
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("omni_server", qwen_image_edit_2509_server_params, indirect=True)
-def test_multi_image_001(omni_server: OmniServer, example_output_dir: Path, input_image: Path):
-    """openai_chat_client.py: multi-image edit (Qwen-Image-Edit-2509)."""
-    case_dir = example_output_dir / "multi_image-001"
+@pytest.mark.parametrize("omni_server", qwen_image_layered_server_params, indirect=True)
+def test_layered_001(omni_server: OmniServer, example_output_dir: Path, input_image: Path):
+    """openai_chat_client.py: layered image generation (Qwen-Image-Layered).
+
+    The model returns multiple RGBA layer images; the client extracts the first
+    layer, which is asserted to be a valid image.
+    """
+    case_dir = example_output_dir / "layered-001"
     case_dir.mkdir(parents=True, exist_ok=True)
-    out = case_dir / "multi_image_001.png"
+    out = case_dir / "layered_001.png"
 
     run_cmd(
         [
@@ -162,9 +166,8 @@ def test_multi_image_001(omni_server: OmniServer, example_output_dir: Path, inpu
             str(I2I_ONLINE_CLIENT),
             "--input",
             str(input_image),
-            str(input_image),
             "--prompt",
-            "Place two bears side-by-side in a snowy mountain landscape",
+            "a rabbit",
             "--output",
             str(out),
             "--server",
@@ -172,7 +175,7 @@ def test_multi_image_001(omni_server: OmniServer, example_output_dir: Path, inpu
             "--steps",
             "50",
             "--seed",
-            "42",
+            "0",
         ]
     )
     assert_image_valid(out)
