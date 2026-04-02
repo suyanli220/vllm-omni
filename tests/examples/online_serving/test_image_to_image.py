@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import requests
 
 from tests.conftest import OmniServer, OmniServerParams, assert_image_valid
 from tests.examples.conftest import EXAMPLES, OUTPUT_DIR, run_cmd
@@ -153,31 +154,47 @@ def test_api_calls_003(): ...
 
 @pytest.mark.parametrize("omni_server", qwen_image_layered_server_params, indirect=True)
 def test_layered_001(omni_server: OmniServer, example_output_dir: Path, input_image: Path):
-    """openai_chat_client.py: layered image generation (Qwen-Image-Layered).
+    """API call: layered image generation (Qwen-Image-Layered).
 
-    The model returns multiple RGBA layer images; the client extracts the first
-    layer, which is asserted to be a valid image.
+    Qwen-Image-Layered returns all generated RGBA layer images as separate
+    content items inside ``choices[0].message.content``.  This test calls the
+    API directly (rather than through the example client, which only saves the
+    first layer) so that every returned layer is decoded, written to disk, and
+    validated as a well-formed image.
     """
     case_dir = example_output_dir / "layered-001"
     case_dir.mkdir(parents=True, exist_ok=True)
-    out = case_dir / "layered_001.png"
 
-    run_cmd(
-        [
-            sys.executable,
-            str(I2I_ONLINE_CLIENT),
-            "--input",
-            str(input_image),
-            "--prompt",
-            "a rabbit",
-            "--output",
-            str(out),
-            "--server",
-            f"http://{omni_server.host}:{omni_server.port}",
-            "--steps",
-            "50",
-            "--seed",
-            "0",
-        ]
+    img_b64 = base64.b64encode(input_image.read_bytes()).decode()
+    url = f"http://{omni_server.host}:{omni_server.port}/v1/chat/completions"
+    payload = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "a rabbit"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+                ],
+            }
+        ],
+        "extra_body": {
+            "num_inference_steps": 50,
+            "seed": 0,
+        },
+    }
+
+    response = requests.post(url, json=payload, timeout=300)
+    response.raise_for_status()
+    content = response.json()["choices"][0]["message"]["content"]
+
+    assert isinstance(content, list) and len(content) > 0, (
+        f"Expected at least one image in response content, got: {content!r}"
     )
-    assert_image_valid(out)
+
+    for idx, item in enumerate(content):
+        image_url = item.get("image_url", {}).get("url", "")
+        assert image_url.startswith("data:image"), f"Layer {idx}: expected a data-URI image, got: {image_url!r}"
+        _, b64_data = image_url.split(",", 1)
+        layer_path = case_dir / f"layered_001_layer_{idx}.png"
+        layer_path.write_bytes(base64.b64decode(b64_data))
+        assert_image_valid(layer_path)
