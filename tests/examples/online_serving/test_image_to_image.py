@@ -6,7 +6,6 @@ See examples/online_serving/image_to_image/README.md
 import base64
 import json
 import sys
-import urllib.request
 from pathlib import Path
 
 import pytest
@@ -19,9 +18,6 @@ pytestmark = [pytest.mark.advanced_model, pytest.mark.example, *hardware_marks(r
 
 I2I_ONLINE_CLIENT = EXAMPLES / "online_serving" / "image_to_image" / "openai_chat_client.py"
 EXAMPLE_OUTPUT_SUBFOLDER = "example_online_i2i"
-
-TEST_IMAGE_URL = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/qwen-bear.png"
-TEST_IMAGE_NAME = "qwen-bear.png"
 
 # ---------------------------------------------------------------------------
 # Server parameter sets.
@@ -47,10 +43,16 @@ def example_output_dir() -> Path:
 
 @pytest.fixture(scope="module")
 def input_image() -> Path:
-    """Download the test bear image once per module run."""
-    image_path = OUTPUT_DIR / TEST_IMAGE_NAME
+    """Return a locally generated synthetic PNG (514×556 RGB) as the I2I input image.
+
+    Uses PIL instead of a runtime network fetch so CI stays hermetic even on
+    runners without outbound internet access or during transient S3 issues.
+    """
+    from PIL import Image
+
+    image_path = OUTPUT_DIR / "qwen-bear.png"
     if not image_path.exists():
-        urllib.request.urlretrieve(TEST_IMAGE_URL, image_path)
+        Image.new("RGB", (514, 556), color=(128, 160, 200)).save(image_path)
     return image_path
 
 

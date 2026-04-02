@@ -4,7 +4,6 @@ See examples/offline_inference/image_to_image/image_to_image.md
 """
 
 import shutil
-import urllib.request
 from pathlib import Path
 
 import pytest
@@ -18,9 +17,6 @@ pytestmark = [pytest.mark.advanced_model, pytest.mark.example, *hardware_marks(r
 I2I_SCRIPT = EXAMPLES / "offline_inference" / "image_to_image" / "image_edit.py"
 README_PATH = I2I_SCRIPT.with_name("image_to_image.md")
 EXAMPLE_OUTPUT_SUBFOLDER = "example_offline_i2i"
-
-TEST_IMAGE_URL = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/omni-assets/qwen-bear.png"
-TEST_IMAGE_NAME = "qwen-bear.png"
 
 
 def _skip_readme_snippet(language: str, code: str, h2_title: str) -> tuple[bool, str]:
@@ -58,10 +54,18 @@ class _I2IExampleRunner(ExampleRunner):
 
 @pytest.fixture(scope="module")
 def input_image() -> Path:
-    """Download the test bear image once per module run."""
-    image_path = OUTPUT_DIR / TEST_IMAGE_NAME
+    """Return a locally generated synthetic PNG (514×556 RGB) as the I2I input image.
+
+    Uses PIL instead of a runtime network fetch so CI stays hermetic even on
+    runners without outbound internet access or during transient S3 issues.
+    The file is named ``qwen-bear.png`` to match the hardcoded filename used in
+    README code snippets (``Image.open("qwen-bear.png")`` / ``--image qwen-bear.png``).
+    """
+    from PIL import Image
+
+    image_path = OUTPUT_DIR / "qwen-bear.png"
     if not image_path.exists():
-        urllib.request.urlretrieve(TEST_IMAGE_URL, image_path)
+        Image.new("RGB", (514, 556), color=(128, 160, 200)).save(image_path)
     return image_path
 
 
