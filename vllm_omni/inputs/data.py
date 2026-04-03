@@ -16,15 +16,8 @@ except ImportError:
 
 
 import torch
-from vllm.inputs import EmbedsPrompt, TextPrompt, TokensPrompt
-
-try:
-    from vllm.inputs import TokensInput
-except ImportError:
-
-    from vllm.inputs.engine import TokensInput
-
-
+from vllm.inputs import EmbedsPrompt, TextPrompt, TokensInput, TokensPrompt
+    
 class OmniTextPrompt(TextPrompt):
     """Text prompt with optional embeddings and additional information.
 

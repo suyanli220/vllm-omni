@@ -254,14 +254,10 @@ class StageDiffusionClient:
                     pass
                 if exitcode is not None and exitcode > 128:
                     sig = exitcode - 128
-                    logger.warning(
-                        "StageDiffusionProc was killed by signal %d; "
-                        "treating as external shutdown.", sig)
+                    logger.warning("StageDiffusionProc was killed by signal %d; treating as external shutdown.", sig)
                     self._shutting_down = True
                     return None
-                raise RuntimeError(
-                    f"StageDiffusionProc died unexpectedly "
-                    f"(exit code {exitcode})")
+                raise RuntimeError(f"StageDiffusionProc died unexpectedly (exit code {exitcode})")
             return None
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
