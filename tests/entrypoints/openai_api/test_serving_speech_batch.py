@@ -115,10 +115,7 @@ class TestSpeechBatchE2E:
             assert result["index"] == i
             assert result["status"] == "success"
             assert result["audio_data"] is not None
-            # Successful items omit `error` entirely (the batch response is
-            # serialized with exclude_none), so probe with .get rather than
-            # indexing a key that is only present on errored items.
-            assert result.get("error") is None
+            assert result["error"] is None
             audio_bytes = base64.b64decode(result["audio_data"])
             assert verify_wav_bytes(audio_bytes), f"Item {i}: invalid WAV"
             assert len(audio_bytes) > MIN_AUDIO_BYTES, f"Item {i}: audio too small ({len(audio_bytes)} bytes)"

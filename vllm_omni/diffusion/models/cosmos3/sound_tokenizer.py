@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Cosmos3 sound tokenizer integration.
-
-The tokenizer decodes model-generated sound latents for video+audio output. It
-does not encode or condition on ``multi_modal_data["audio"]``; request-side
-sound generation is enabled by ``generate_sound`` or ``sound_gen``.
-"""
+"""Cosmos3 sound tokenizer integration."""
 
 from __future__ import annotations
 
