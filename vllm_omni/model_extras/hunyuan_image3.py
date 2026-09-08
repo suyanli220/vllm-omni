@@ -7,8 +7,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
-from PIL import Image
-
 
 def build_x_to_text_prompt(
     model: str,
@@ -45,31 +43,6 @@ def build_x_to_text_prompt(
         },
         ar_inputs.stop_token_ids,
     )
-
-
-def build_image_to_image_prompt(
-    prompt: str,
-    negative_prompt: str | None,
-    input_image: Image.Image | list[Image.Image],
-    height: int | None = None,
-    width: int | None = None,
-) -> dict[str, Any]:
-    """Build a HunyuanImage-3.0 image-editing (IT2I) engine prompt.
-
-    A single reference image is forwarded as-is; a list (up to
-    ``MAX_IMAGES_PER_REQUEST``) is forwarded for multi-image editing. As with
-    text-to-image, AR token-ids / stop-token-ids are sourced inside the AR
-    input path from the ``bot_task`` / ``use_system_prompt`` knobs.
-    """
-    del height, width
-    out: dict[str, Any] = {
-        "prompt": prompt,
-        "modalities": ["image"],
-        "multi_modal_data": {"image": input_image},
-    }
-    if negative_prompt is not None:
-        out["negative_prompt"] = negative_prompt
-    return out
 
 
 @dataclass

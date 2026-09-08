@@ -619,23 +619,6 @@ def test_hunyuan_image3_extra_registry_matches_runtime_model_class_name() -> Non
     ) == should_init_extra_args_for_non_diffusion_stages("HunyuanImage3Pipeline")
 
 
-@pytest.mark.core_model
-@pytest.mark.cpu
-def test_hunyuan_image3_image_to_image_prompt_builder() -> None:
-    img = Image.new("RGB", (64, 64))
-    out = build_image_to_image_prompt(
-        "HunyuanImage3Pipeline",
-        prompt="make it snow",
-        negative_prompt=None,
-        input_image=img,
-    )
-    assert out == {
-        "prompt": "make it snow",
-        "modalities": ["image"],
-        "multi_modal_data": {"image": img},
-    }
-
-
 class _FakeHunyuanTokenizer:
     """Minimal tokenizer with distinct ids so AR token assertions are unambiguous."""
 
