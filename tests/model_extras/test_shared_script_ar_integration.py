@@ -149,9 +149,12 @@ def test_apply_ar_stage_inputs_routes_through_real_registry(
     assert prompt_dict.get("use_system_prompt") == "en_recaption"
     assert prompt_dict.get("modalities") == ["image"]
 
-    # stop_token_ids reached the AR-stage params, and only those.
+    # stop_token_ids reached the AR-stage params, and only those. The diffusion
+    # stage must be left untouched: OmniDiffusionSamplingParams has no
+    # stop_token_ids field, so the helper skipping it means the attribute is
+    # never created (reading it would raise AttributeError, not return None).
     assert ar_params.stop_token_ids, "AR stage did not receive stop_token_ids"
-    assert diffusion_params.stop_token_ids is None
+    assert not hasattr(diffusion_params, "stop_token_ids"), "diffusion stage params must not receive stop_token_ids"
 
 
 @pytest.mark.parametrize(
