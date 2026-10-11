@@ -652,7 +652,7 @@ def test_sample_rejects_rows_without_finite_logits():
     metadata.allowed_token_ids_mask = torch.tensor([[True, False, True]])
     logits = torch.tensor([[0.0, float("nan"), 0.0]], dtype=torch.float32)
 
-    with pytest.raises(ValueError, match="no finite logits"):
+    with pytest.raises(RuntimeError, match="no finite logits"):
         model.sample(logits, metadata)
 
 
@@ -676,7 +676,14 @@ def _reference_param(param, row, default):
 
 
 def _reference_ras_one(weighted_scores, history, *, top_p, top_k, win_size, tau_r, generator):
-    """Serial RAS oracle from the pre-B1 implementation, including RNG draws."""
+    """Serial RAS oracle for one row, including its RNG draws.
+
+    The batched sampler decides rejection on the device, so a random row
+    consumes both the nucleus draw and the rejection redraw every step whether
+    or not it rejected its token. This oracle follows the same RNG schedule --
+    only the selection between the two draws is conditional -- so comparing
+    against it still pins per-request generator ownership and token choice.
+    """
     probs, ids = weighted_scores.softmax(dim=0).sort(descending=True, stable=True)
     keep = probs.cumsum(dim=0) - probs < top_p
     if top_k > 0:
@@ -684,14 +691,16 @@ def _reference_ras_one(weighted_scores, history, *, top_p, top_k, win_size, tau_
     generators = {} if generator is None else {0: generator}
     draw = random_sample((probs * keep).unsqueeze(0), generators).reshape(())
     token = int(ids[draw].item())
-    if win_size > 0 and history:
-        recent = torch.tensor(history[-win_size:], device=probs.device)
-        if int((recent == token).sum().item()) >= win_size * tau_r:
-            scores = weighted_scores.clone()
-            original = scores[token].clone()
-            scores[token] = float("-inf")
-            scores[token] = torch.where(torch.isfinite(scores).any(), scores[token], original)
-            token = int(random_sample(scores.softmax(dim=0).unsqueeze(0), generators).item())
+    if win_size > 0:
+        recent = torch.tensor(history[-win_size:], device=probs.device, dtype=torch.long)
+        repeated = recent.numel() > 0 and int((recent == token).sum().item()) >= win_size * tau_r
+        scores = weighted_scores.clone()
+        original = scores[token].clone()
+        scores[token] = float("-inf")
+        scores[token] = torch.where(torch.isfinite(scores).any(), scores[token], original)
+        replacement = int(random_sample(scores.softmax(dim=0).unsqueeze(0), generators).item())
+        if repeated:
+            token = replacement
     return token
 
 
@@ -865,7 +874,7 @@ def test_mixed_ras_rejects_invalid_random_row_before_consuming_rng():
     generator = torch.Generator().manual_seed(123)
     metadata.generators = {1: generator}
     before = generator.get_state().clone()
-    with pytest.raises(ValueError, match="no finite logits"):
+    with pytest.raises(RuntimeError, match="no finite logits"):
         model.sample(torch.tensor([[1.0, 0.0], [float("nan"), float("-inf")]]), metadata)
     assert torch.equal(generator.get_state(), before)
 

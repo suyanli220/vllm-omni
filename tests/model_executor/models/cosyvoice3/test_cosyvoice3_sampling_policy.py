@@ -27,19 +27,23 @@ def _host_params(temperature=1.0, frequency_penalty=0.0, presence_penalty=0.0):
 
 
 @pytest.mark.parametrize("mixed", [False, True])
-def test_host_policy_avoids_parameter_tensor_reads(monkeypatch, mixed):
+@pytest.mark.parametrize("history", [[[], []], [[1] * 10, [1] * 10]])
+def test_host_policy_avoids_parameter_tensor_reads(monkeypatch, mixed, history):
     model = _make_talker_model()
-    metadata = _make_sampling_metadata(output_token_ids=[[], []])
+    metadata = _make_sampling_metadata(output_token_ids=history)
     metadata.all_random = not mixed
     temperatures = [0.0 if mixed else 1.0, 1.0]
     metadata.temperature = torch.tensor(temperatures)
     params = [_host_params(t) for t in temperatures]
 
-    # No history => no rejection predicate read. The finite-logits check must
-    # remain, but parameter reductions and mixed-temperature readback must not.
+    # Nothing on the token critical path may read the device: not the parameter
+    # reductions, not the greedy mask, and -- with a repeating history -- not
+    # the rejection predicate or the sampled token itself. The finite-logits
+    # check reports asynchronously rather than reading its predicate back.
     with monkeypatch.context() as patch:
         patch.setattr(torch, "any", lambda *a, **k: pytest.fail("device penalty probe"))
-        patch.setattr(torch.Tensor, "tolist", lambda *a, **k: pytest.fail("greedy mask readback"))
+        patch.setattr(torch.Tensor, "tolist", lambda *a, **k: pytest.fail("device readback"))
+        patch.setattr(torch.Tensor, "item", lambda *a, **k: pytest.fail("device readback"))
         out = model.sample(torch.tensor([[float("-inf"), 2.0]] * 2), metadata, per_req_sampling_params=params)
     assert out.sampled_token_ids.tolist() == [[1], [1]]
 
@@ -136,7 +140,7 @@ def test_host_policy_keeps_invalid_logits_check_and_rng_state():
     generator = torch.Generator().manual_seed(12)
     metadata.generators = {0: generator}
     before = generator.get_state().clone()
-    with pytest.raises(ValueError, match="no finite logits"):
+    with pytest.raises(RuntimeError, match="no finite logits"):
         model.sample(torch.full((1, 2), float("nan")), metadata, per_req_sampling_params=[_host_params()])
     assert torch.equal(generator.get_state(), before)
 
@@ -211,8 +215,13 @@ def test_host_policy_real_input_batch_and_runner(monkeypatch, repetition_penalty
     run()
 
 
-def test_host_policy_benchmark_initializes_rng_in_fresh_process():
-    """Pytest already imports Omni; a fresh CLI process must use the same RNG."""
+def test_rng_patch_is_installed_in_a_fresh_process():
+    """Pytest already imports Omni; a fresh CLI process must use the same RNG.
+
+    RAS binds ``random_sample`` at import time, so a process that reaches the
+    sampler without Omni's batched-seeded patch would draw per-request noise
+    through vLLM's per-row loop and diverge from every seeded expectation here.
+    """
     import subprocess
     import sys
     from pathlib import Path
@@ -221,8 +230,11 @@ def test_host_policy_benchmark_initializes_rng_in_fresh_process():
         [
             sys.executable,
             "-c",
-            "from benchmarks.tts.benchmark_cosyvoice3_b1 import load_runtime; "
-            "r = load_runtime(); assert getattr(r.random_sample, '_omni_batched_seeded', False)",
+            "import vllm_omni;"
+            "from vllm.v1.sample.ops.topk_topp_sampler import random_sample;"
+            "from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model as M;"
+            "assert getattr(random_sample, '_omni_batched_seeded', False), 'RNG patch missing';"
+            "assert M._ras_sample_batch.__globals__['random_sample'] is random_sample, 'RAS bound a stale sampler'",
         ],
         cwd=Path(__file__).resolve().parents[4],
         check=True,

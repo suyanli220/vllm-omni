@@ -920,13 +920,26 @@ class CosyVoice3Model(
     ) -> torch.Tensor:
         """Batch RAS, excluding greedy rows from all RNG draws.
 
+        Sampling, repetition detection and rejection resampling all stay on the
+        device: nothing reads a sampled token or a rejection flag back to the
+        host, so no step of this blocks the token critical path. The remaining
+        host inputs are request metadata the scheduler already owns on the CPU
+        (the greedy mask and the decoded-token histories), which cross to the
+        device as writes, not as syncs.
+
         The runner can supply a host greedy mask from request parameters; direct
         callers without it read the mask once per mixed batch. The all-random
         path needs neither. Compact row indices retain request-owned generators
         and histories; greedy generators must not advance.
-        Rejection flags cross to the host once per batch so only requests that
-        actually reject a token consume a second RNG draw. Per-request seeded
-        generators retain their ownership when rejection compacts the batch.
+
+        Every random row consumes exactly two draws per step whenever RAS
+        windowing is enabled -- the nucleus draw and the rejection redraw --
+        regardless of whether that row actually rejected its token. The RNG
+        schedule is therefore a function of configuration and batch layout
+        only, never of sampled token values, which is what lets the rejection
+        decision stay on the device. Seeded requests remain reproducible, but
+        their trajectories differ from an implementation that draws only for
+        rejected rows.
         """
         batch_size = logits.shape[0]
 
@@ -970,31 +983,38 @@ class CosyVoice3Model(
         draws = random_sample(weights, generators).reshape(-1, 1).long()
         sampled = sorted_ids.gather(1, draws).squeeze(1)
 
-        if win_size > 0 and any(histories):
+        if win_size > 0 and len(histories) == logits.shape[0]:
             recent = []
             for tokens in histories:
                 row = tokens[-win_size:]
                 recent.append([-1] * (win_size - len(row)) + row)
             history = torch.tensor(recent, dtype=torch.long, device=logits.device)
+            # Padding is -1, so a row with no history can never reject.
             repeated = ((history == sampled.unsqueeze(1)).sum(dim=1) >= win_size * tau_r) & (history >= 0).any(dim=1)
-            rejected_rows = [i for i, reject in enumerate(repeated.tolist()) if reject]
-            if rejected_rows:
-                rows = torch.tensor(rejected_rows, device=logits.device, dtype=torch.long)
-                scores = weighted_scores.index_select(0, rows)
-                rejected_ids = sampled.index_select(0, rows).unsqueeze(1)
-                original = scores.gather(1, rejected_ids)
-                scores.scatter_(1, rejected_ids, float("-inf"))
-                replacement = torch.where(
-                    torch.isfinite(scores).any(dim=1, keepdim=True),
+            # The replacement is drawn for the whole batch and selected on the
+            # device. Reading ``repeated`` to draw only for rejected rows costs
+            # a blocking sync on the token critical path every step, which the
+            # gap decomposition in #6870 prices at ~116 us; the extra draw is
+            # one more kernel on the sampling stream. ``weighted_scores`` is
+            # not read after this point, so blank the drawn token in place.
+            drawn = sampled.unsqueeze(1)
+            original = weighted_scores.gather(1, drawn)
+            weighted_scores.scatter_(1, drawn, float("-inf"))
+            # A row whose only finite score was the drawn token keeps it,
+            # instead of resampling from an all--inf distribution.
+            weighted_scores.scatter_(
+                1,
+                drawn,
+                torch.where(
+                    torch.isfinite(weighted_scores).any(dim=1, keepdim=True),
                     torch.full_like(original, float("-inf")),
                     original,
-                )
-                scores.scatter_(1, rejected_ids, replacement)
-                compact_generators = {i: generators[row] for i, row in enumerate(rejected_rows) if row in generators}
-                # RAS rejection samples the complete remaining distribution,
-                # without applying top-k/top-p a second time.
-                replacement_ids = random_sample(scores.softmax(dim=1), compact_generators).reshape(-1).long()
-                sampled.index_copy_(0, rows, replacement_ids)
+                ),
+            )
+            # RAS rejection samples the complete remaining distribution,
+            # without applying top-k/top-p a second time.
+            replacement_ids = random_sample(weighted_scores.softmax(dim=1), generators).reshape(-1).long()
+            sampled = torch.where(repeated, replacement_ids, sampled)
         sampled = sampled.to(torch.int32)
         if mixed_batch is not None:
             mixed_output, random_indices = mixed_batch
@@ -1065,8 +1085,14 @@ class CosyVoice3Model(
         speech_head_size = int(self.config.llm["speech_token_size"]) + 200
         logits = logits[..., :speech_head_size]
         finite_logits = torch.isfinite(logits)
-        if not finite_logits.any(dim=-1).all().item():
-            raise ValueError("CosyVoice3 sampling received a row with no finite logits")
+        # Reported from the device so a broken row still fails loudly without
+        # pulling the predicate to the host on every decode step. The assert is
+        # enqueued on the sampling stream; on CUDA it surfaces as a device-side
+        # assertion at the next synchronization rather than here.
+        torch._assert_async(
+            finite_logits.any(dim=-1).all(),
+            "CosyVoice3 sampling received a row with no finite logits",
+        )
         logits.masked_fill_(~finite_logits, float("-inf"))
 
         sampling_cfg = dict(self.config.llm.get("sampling", {}))
