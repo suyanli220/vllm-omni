@@ -16,6 +16,12 @@ to model chunks (see ``one_request``'s docstring).
 Running with no flags reproduces the default matrix. Per-request correctness
 is checked: non-silent, long enough, and (with a fixed ``--seed``)
 byte-identical PCM across requests for the same text.
+
+For A/B work use ``--fixed-output-tokens`` (see its ``--help``). Natural-EOS
+runs produce different generation lengths between repeats of the same
+configuration at concurrency > 1, so an A/B delta measured against them is
+not attributable to the change under test; a pinned token count and a
+full-batch warmup are prerequisites, not refinements.
 """
 
 import argparse
@@ -157,7 +163,7 @@ def _token_hop_lengths(chunk_frames: int, max_chunk_frames: int):
         yield hop
 
 
-def one_request(client, url, model, text, ref_audio, ref_text, chunk_frames, seed=None):
+def one_request(client, url, model, text, ref_audio, ref_text, chunk_frames, seed=None, max_new_tokens=None):
     """Run one streaming request, returning TTFA, E2E, per-chunk gaps, and audio bytes.
 
     ``response_format=pcm`` + ``stream_format=audio`` streams raw bytes with no
@@ -181,6 +187,8 @@ def one_request(client, url, model, text, ref_audio, ref_text, chunk_frames, see
     }
     if seed is not None:
         payload["seed"] = seed
+    if max_new_tokens is not None:
+        payload["max_new_tokens"] = max_new_tokens
     t0 = time.perf_counter()
     ttfa = None
     nbytes = 0
@@ -227,6 +235,7 @@ def one_request(client, url, model, text, ref_audio, ref_text, chunk_frames, see
     e2e = time.perf_counter() - t0
     audio_s = nbytes / 2 / SAMPLE_RATE
     return {
+        "output_tokens": nbytes / bytes_per_token,
         "ttfa_s": ttfa,
         "e2e_s": e2e,
         "audio_s": audio_s,
@@ -252,6 +261,37 @@ def check_correctness(r: dict, min_audio_s: float) -> list[str]:
     return problems
 
 
+def check_fixed_output_length(ok: list[dict], expected_tokens: int) -> list[str]:
+    """Return violations of the fixed-output-length contract (empty = pass).
+
+    The whole point of ``--fixed-output-tokens`` is that both arms of an A/B
+    decode the same number of steps, so an unequal length anywhere makes the
+    cell's latencies incomparable and must fail the run rather than be averaged
+    away. Byte counts are compared directly (assumption-free); the implied token
+    count is checked separately so a server-side clamp cannot pass silently.
+    """
+    problems = []
+    counts = {r["nbytes"] for r in ok}
+    if len(counts) > 1:
+        by_text: dict[str, set] = {}
+        for r in ok:
+            by_text.setdefault(r.get("text"), set()).add(r["nbytes"])
+        detail = ", ".join(f"{t[:20]!r}: {sorted(v)}" for t, v in by_text.items())
+        problems.append(
+            f"output length not pinned: {len(counts)} distinct PCM sizes across {len(ok)} requests ({detail})"
+        )
+    for nbytes in sorted(counts):
+        tokens = nbytes / (TOKEN_MEL_RATIO * SAMPLES_PER_MEL * 2)
+        if tokens != expected_tokens:
+            problems.append(
+                f"generated {tokens:g} tokens, expected {expected_tokens} ({nbytes} B). "
+                "min_tokens only suppresses EOS up to min_token_text_ratio x text tokens, so "
+                "--fixed-output-tokens above that bound leaves EOS free; lower it or drop the "
+                "shortest --text."
+            )
+    return problems
+
+
 def drive(url, args, n, conc, label, results, lock, idx, chunk_frames):
     """Run ``n`` requests at concurrency ``conc``, cycling through ``args.texts``."""
     texts = args.texts
@@ -267,7 +307,15 @@ def drive(url, args, n, conc, label, results, lock, idx, chunk_frames):
                 text = texts[i % len(texts)]
                 try:
                     r = one_request(
-                        c, url, args.model, text, args.ref_audio, args.ref_text, chunk_frames, seed=args.seed
+                        c,
+                        url,
+                        args.model,
+                        text,
+                        args.ref_audio,
+                        args.ref_text,
+                        chunk_frames,
+                        seed=args.seed,
+                        max_new_tokens=args.fixed_output_tokens,
                     )
                     r["text"] = text
                     with lock:
@@ -332,8 +380,12 @@ def run_combo(args, conc: int, chunk_frames: int, out: Path) -> dict:
         lock = threading.Lock()
         idx = [0]
         if args.warmup:
-            print(f"  warmup ({args.warmup} req)", flush=True)
-            drive(url, args, args.warmup, min(conc, args.warmup), "warmup", results, lock, idx, chunk_frames)
+            # Warm up at the measured concurrency, not at min(conc, warmup):
+            # a batch-of-1 warmup leaves the first measured steps paying
+            # full-batch first-touch costs, which lands in the A/B delta.
+            warmup_n = max(args.warmup, conc)
+            print(f"  warmup ({warmup_n} req @ concurrency {conc})", flush=True)
+            drive(url, args, warmup_n, conc, "warmup", results, lock, idx, chunk_frames)
             results.clear()
             idx[0] = 0
 
@@ -342,8 +394,15 @@ def run_combo(args, conc: int, chunk_frames: int, out: Path) -> dict:
 
         ok = [r for r in results if r.get("ttfa_s") is not None]
         problems = []
+        # A pinned token count can legitimately be shorter than the default
+        # floor, so the duration check follows the pin instead of fighting it.
+        min_audio_s = args.min_audio_s
+        if args.fixed_output_tokens is not None:
+            min_audio_s = min(min_audio_s, args.fixed_output_tokens * TOKEN_MEL_RATIO * SAMPLES_PER_MEL / SAMPLE_RATE)
         for r in ok:
-            problems += check_correctness(r, args.min_audio_s)
+            problems += check_correctness(r, min_audio_s)
+        if args.fixed_output_tokens is not None and ok:
+            problems += check_fixed_output_length(ok, args.fixed_output_tokens)
         # With a fixed seed, same-text requests must produce byte-identical PCM (per text group)
         if args.seed is not None:
             by_text: dict[str, bytes] = {}
@@ -374,6 +433,8 @@ def run_combo(args, conc: int, chunk_frames: int, out: Path) -> dict:
             "correctness_sample": problems[:5],
             "total_audio_s": total_audio_s,
             "throughput_audio_s_per_s": total_audio_s / wall if wall > 0 else float("nan"),
+            "fixed_output_tokens": args.fixed_output_tokens,
+            "output_tokens": _stats([r["output_tokens"] for r in ok]),
             "ttfa_s": _stats([r["ttfa_s"] for r in ok]),
             "e2e_s": _stats([r["e2e_s"] for r in ok]),
             "rtf": _stats([r["rtf"] for r in ok]),
@@ -432,7 +493,27 @@ def parse_args() -> argparse.Namespace:
         help="codec_chunk_frames values to sweep (the streaming step size).",
     )
     p.add_argument("--num-prompts", type=int, default=30)
-    p.add_argument("--warmup", type=int, default=2)
+    p.add_argument(
+        "--warmup",
+        type=int,
+        default=2,
+        help="Warmup requests before the measured block. Raised to the cell's "
+        "concurrency when lower, so warmup always fills the batch.",
+    )
+    p.add_argument(
+        "--fixed-output-tokens",
+        type=int,
+        default=None,
+        help="Pin every request to exactly this many generated speech tokens, "
+        "instead of stopping at EOS. Required for A/B comparisons: natural-EOS "
+        "runs give different lengths between repeats of the same configuration, "
+        "so the delta is not attributable to the change under test. Sent as "
+        "max_new_tokens, which the CosyVoice3 adapter also clamps min_tokens "
+        "to, suppressing EOS; the run fails if the resulting lengths are not "
+        "all identical. The pin only holds while this is <= "
+        "min_token_text_ratio (2) x the shortest --text's token count, so "
+        "prefer one long --text over the default three-length cycle.",
+    )
     p.add_argument("--port", type=int, default=8091)
     p.add_argument(
         "--server-timeout",
@@ -490,14 +571,19 @@ def main() -> None:
 
     print("\n=== SUMMARY ===")
     header = (
-        f"{'conc':>4} {'step':>4} {'ok':>4} {'corr':>4} "
+        f"{'conc':>4} {'step':>4} {'ok':>4} {'corr':>4} {'tokens':>12} "
         f"{'TTFA med(ms)':>12} {'step med(ms)':>12} {'step p95(ms)':>12} {'RTF mean+-sd':>14}"
     )
     print(header)
     print("-" * len(header))
     for r in all_results:
+        tokens = r["output_tokens"]
+        # In a pinned run min == max; a range here means the pin did not hold.
+        lo, hi = tokens["min"], tokens["max"]
+        token_col = "-" if tokens["n"] == 0 else format(lo, "g") if lo == hi else f"{lo:g}-{hi:g}"
         print(
             f"{r['concurrency']:>4} {r['step_size']:>4} {r['ok']:>4} {r['correctness_problems']:>4} "
+            f"{token_col:>12} "
             f"{r['ttfa_s']['median'] * 1e3:>12.1f} "
             f"{r['step_latency_ms']['median']:>12.1f} {r['step_latency_ms']['p95']:>12.1f} "
             f"{r['rtf']['mean']:>6.3f}+-{r['rtf']['stdev']:>5.3f}"
