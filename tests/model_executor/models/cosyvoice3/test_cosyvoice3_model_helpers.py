@@ -606,8 +606,14 @@ def test_sample_uses_ras_rejection_for_recent_repetition():
 
 
 def test_sample_tolerates_padded_rows_without_history():
+    """A short history list must pad per row, never broadcast across requests.
+
+    Row 1 has no decoded tokens, and its peaked token is exactly the one row 0
+    has been repeating. Sharing row 0's history would reject row 1's token and
+    push it onto 1; padding correctly leaves it on 2.
+    """
     model = _make_talker_model()
-    metadata = _make_sampling_metadata(output_token_ids=[[1] * 10])
+    metadata = _make_sampling_metadata(output_token_ids=[[2] * 10])
     logits = torch.tensor(
         [
             [-1e9, 10.0, 0.0],
@@ -620,6 +626,8 @@ def test_sample_tolerates_padded_rows_without_history():
 
     assert out is not None
     assert out.sampled_token_ids.shape == (2, 1)
+    # Row 0 draws 1, which its history of 2s does not repeat, so it stands.
+    assert out.sampled_token_ids.tolist() == [[1], [2]]
 
 
 def test_sample_excludes_non_finite_logits():

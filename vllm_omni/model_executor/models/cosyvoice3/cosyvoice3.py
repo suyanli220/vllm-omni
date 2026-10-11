@@ -970,7 +970,7 @@ class CosyVoice3Model(
             temperature = temperature.index_select(0, random_indices)
             top_p = top_p.index_select(0, random_indices)
             top_k = top_k.index_select(0, random_indices)
-            histories = [histories[i] for i in random_rows] if histories else []
+            histories = [histories[i] if i < len(histories) else [] for i in random_rows]
             generators = {i: generators[row] for i, row in enumerate(random_rows) if row in generators}
             mixed_batch = mixed_output, random_indices
         weighted_scores = torch.log_softmax(logits / temperature.clamp_min(self._sampling_eps).unsqueeze(1), dim=1)
@@ -983,10 +983,16 @@ class CosyVoice3Model(
         draws = random_sample(weights, generators).reshape(-1, 1).long()
         sampled = sorted_ids.gather(1, draws).squeeze(1)
 
-        if win_size > 0 and len(histories) == logits.shape[0]:
+        if win_size > 0:
+            # One padded row per batch row, indexed positionally. A short
+            # history list means trailing rows have no decoded tokens yet, not
+            # that they share the first row's -- comparing a (1, win_size)
+            # history against (batch, 1) tokens would broadcast one request's
+            # repetitions onto every other row, and any other short length
+            # would fail to broadcast at all.
             recent = []
-            for tokens in histories:
-                row = tokens[-win_size:]
+            for i in range(logits.shape[0]):
+                row = histories[i][-win_size:] if i < len(histories) else []
                 recent.append([-1] * (win_size - len(row)) + row)
             history = torch.tensor(recent, dtype=torch.long, device=logits.device)
             # Padding is -1, so a row with no history can never reject.
