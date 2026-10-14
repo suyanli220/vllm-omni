@@ -38,7 +38,6 @@ from vllm.sampling_params import SamplingParams
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.sample.ops.topk_topp_sampler import random_sample
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct, to_dict, to_struct
@@ -60,6 +59,7 @@ from vllm_omni.model_executor.models.cosyvoice3.utils import (
     mel_spectrogram,
     unpad_prompt_conditioning,
 )
+from vllm_omni.model_executor.models.cosyvoice3.v1_sampling import categorical_sample, nucleus_sample
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
@@ -941,6 +941,8 @@ class CosyVoice3Model(
         if top_k is None:
             top_k = torch.full((batch_size,), default_top_k, device=logits.device)
         histories = sampling_metadata.output_token_ids
+        # History can omit padding rows; normalize once before either compaction.
+        histories = [histories[i] if i < len(histories) else [] for i in range(batch_size)]
         generators = sampling_metadata.generators
         mixed_batch = None
         if not sampling_metadata.all_random:
@@ -957,26 +959,21 @@ class CosyVoice3Model(
             temperature = temperature.index_select(0, random_indices)
             top_p = top_p.index_select(0, random_indices)
             top_k = top_k.index_select(0, random_indices)
-            histories = [histories[i] for i in random_rows] if histories else []
+            histories = [histories[i] for i in random_rows]
             generators = {i: generators[row] for i, row in enumerate(random_rows) if row in generators}
             mixed_batch = mixed_output, random_indices
         weighted_scores = torch.log_softmax(logits / temperature.clamp_min(self._sampling_eps).unsqueeze(1), dim=1)
         sorted_probs, sorted_ids = weighted_scores.softmax(dim=1).sort(dim=1, descending=True, stable=True)
-        # Keep top-p based on the full distribution, before top-k masking.
-        keep = (sorted_probs.cumsum(dim=1) - sorted_probs) < top_p.unsqueeze(1)
-        ranks = torch.arange(logits.shape[1], device=logits.device)
-        keep &= (top_k.unsqueeze(1) <= 0) | (ranks.unsqueeze(0) < top_k.unsqueeze(1))
-        weights = sorted_probs * keep.to(sorted_probs.dtype)
-        draws = random_sample(weights, generators).reshape(-1, 1).long()
-        sampled = sorted_ids.gather(1, draws).squeeze(1)
-
+        history = None
         if win_size > 0 and any(histories):
-            recent = []
-            for tokens in histories:
-                row = tokens[-win_size:]
-                recent.append([-1] * (win_size - len(row)) + row)
-            history = torch.tensor(recent, dtype=torch.long, device=logits.device)
-            repeated = ((history == sampled.unsqueeze(1)).sum(dim=1) >= win_size * tau_r) & (history >= 0).any(dim=1)
+            recent = [tokens[-win_size:] for tokens in histories]
+            history = torch.tensor(
+                [[-1] * (win_size - len(row)) + row for row in recent], dtype=torch.long, device=logits.device
+            )
+        sampled, repeated = nucleus_sample(
+            sorted_probs, sorted_ids, top_p, top_k, history, win_size * tau_r, generators
+        )
+        if repeated is not None:
             rejected_rows = [i for i, reject in enumerate(repeated.tolist()) if reject]
             if rejected_rows:
                 rows = torch.tensor(rejected_rows, device=logits.device, dtype=torch.long)
@@ -993,7 +990,7 @@ class CosyVoice3Model(
                 compact_generators = {i: generators[row] for i, row in enumerate(rejected_rows) if row in generators}
                 # RAS rejection samples the complete remaining distribution,
                 # without applying top-k/top-p a second time.
-                replacement_ids = random_sample(scores.softmax(dim=1), compact_generators).reshape(-1).long()
+                replacement_ids = categorical_sample(scores.softmax(dim=1), compact_generators).reshape(-1).long()
                 sampled.index_copy_(0, rows, replacement_ids)
         sampled = sampled.to(torch.int32)
         if mixed_batch is not None:

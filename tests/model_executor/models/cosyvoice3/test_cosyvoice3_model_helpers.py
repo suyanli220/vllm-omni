@@ -605,21 +605,23 @@ def test_sample_uses_ras_rejection_for_recent_repetition():
     assert out.sampled_token_ids.tolist() == [[2]]
 
 
-def test_sample_tolerates_padded_rows_without_history():
+@pytest.mark.parametrize("history_rows", [1, 2, 4])
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("win_size", [0, 10])
+def test_sample_aligns_history_with_active_rows(history_rows, mixed, win_size):
     model = _make_talker_model()
-    metadata = _make_sampling_metadata(output_token_ids=[[1] * 10])
-    logits = torch.tensor(
-        [
-            [-1e9, 10.0, 0.0],
-            [-1e9, 0.0, 10.0],
-        ],
-        dtype=torch.float32,
-    )
-
+    model.config.llm["sampling"]["win_size"] = win_size
+    metadata = _make_sampling_metadata(output_token_ids=[[], [], []])
+    metadata.output_token_ids = [[1] * 10] + [[] for _ in range(history_rows - 1)]
+    metadata.all_random = not mixed
+    if mixed:
+        metadata.temperature[0] = 0.0
+    # Every primary draw is forced to token 1. Only row 0 owns that history.
+    metadata.top_k.fill_(1)
+    logits = torch.tensor([[-float("inf"), 10.0, 0.0]] * 3)
     out = model.sample(logits, metadata)
-
-    assert out is not None
-    assert out.sampled_token_ids.shape == (2, 1)
+    expected_first = 2 if win_size and not mixed else 1
+    assert out.sampled_token_ids.tolist() == [[expected_first], [1], [1]]
 
 
 def test_sample_excludes_non_finite_logits():
@@ -818,6 +820,36 @@ def test_mixed_ras_request_reordering_preserves_generator_ownership():
             assert torch.equal(actual_generators[req].get_state(), reference_generators[req].get_state())
 
 
+@pytest.mark.parametrize("reject", [False, True])
+def test_mixed_ras_only_resamples_rejected_rows(monkeypatch, reject):
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[1] * 10, [1] * 10 if reject else [], [], []])
+    metadata.all_random = False
+    metadata.temperature = torch.tensor([0.0, 1.0, 1.0, 1.0])
+    metadata.top_k.fill_(1)
+    metadata.generators = {i: torch.Generator().manual_seed(i) for i in range(4)}
+    calls = []
+    draw = cosyvoice3.categorical_sample
+    initial_draw = cosyvoice3.nucleus_sample
+
+    def record(probs, generators):
+        calls.append((probs.shape[0], list(generators.values())))
+        return draw(probs, generators)
+
+    def record_initial(probs, indices, top_p, top_k, history, threshold, generators):
+        calls.append((probs.shape[0], list(generators.values())))
+        return initial_draw(probs, indices, top_p, top_k, history, threshold, generators)
+
+    monkeypatch.setattr(cosyvoice3, "nucleus_sample", record_initial)
+    monkeypatch.setattr(cosyvoice3, "categorical_sample", record)
+    out = model.sample(torch.tensor([[-float("inf"), 10.0, 0.0]] * 4), metadata)
+    expected = [(3, [metadata.generators[i] for i in (1, 2, 3)])]
+    if reject:
+        expected.append((1, [metadata.generators[1]]))
+    assert calls == expected
+    assert out.sampled_token_ids.tolist() == [[1], [2 if reject else 1], [1], [1]]
+
+
 @pytest.mark.parametrize("temperature", [0.0, 1e-6, 1e-5])
 def test_mixed_ras_greedy_rows_never_draw_random_numbers(temperature, monkeypatch):
     model = _make_talker_model()
@@ -825,7 +857,7 @@ def test_mixed_ras_greedy_rows_never_draw_random_numbers(temperature, monkeypatc
     metadata.all_random = False
     metadata.temperature = torch.full((2,), temperature)
     assert float(metadata.temperature[0]) < model._sampling_eps
-    monkeypatch.setattr(cosyvoice3, "random_sample", lambda *a, **k: pytest.fail("greedy must not consume RNG"))
+    monkeypatch.setattr(cosyvoice3, "nucleus_sample", lambda *a, **k: pytest.fail("greedy must not consume RNG"))
     out = model.sample(torch.tensor([[0.0, 2.0], [3.0, 0.0]]), metadata)
     assert out.sampled_token_ids.tolist() == [[1], [0]]
 

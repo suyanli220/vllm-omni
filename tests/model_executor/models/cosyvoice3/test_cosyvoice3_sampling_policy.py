@@ -51,7 +51,7 @@ def test_host_policy_matches_float32_greedy_boundary(monkeypatch, temperature):
     metadata.all_random = False
     metadata.temperature = torch.tensor([temperature], dtype=torch.float32)
     assert float(metadata.temperature[0]) < model._sampling_eps
-    monkeypatch.setattr(cosyvoice3, "random_sample", lambda *a, **k: pytest.fail("greedy must not advance RNG"))
+    monkeypatch.setattr(cosyvoice3, "nucleus_sample", lambda *a, **k: pytest.fail("greedy must not advance RNG"))
     out = model.sample(torch.tensor([[0.0, 2.0]]), metadata, per_req_sampling_params=[_host_params(temperature)])
     assert out.sampled_token_ids.tolist() == [[1]]
 
@@ -211,7 +211,7 @@ def test_host_policy_real_input_batch_and_runner(monkeypatch, repetition_penalty
     run()
 
 
-def test_host_policy_benchmark_initializes_rng_in_fresh_process():
+def test_sampler_initializes_rng_in_fresh_process():
     """Pytest already imports Omni; a fresh CLI process must use the same RNG."""
     import subprocess
     import sys
@@ -221,8 +221,10 @@ def test_host_policy_benchmark_initializes_rng_in_fresh_process():
         [
             sys.executable,
             "-c",
-            "from benchmarks.tts.benchmark_cosyvoice3_b1 import load_runtime; "
-            "r = load_runtime(); assert getattr(r.random_sample, '_omni_batched_seeded', False)",
+            "from vllm_omni.model_executor.models.cosyvoice3.v1_sampling import random_sample; "
+            "from vllm.v1.sample.ops.topk_topp_sampler import random_sample as initialized; "
+            "assert random_sample is initialized; "
+            "assert getattr(random_sample, '_omni_batched_seeded', False)",
         ],
         cwd=Path(__file__).resolve().parents[4],
         check=True,
