@@ -944,7 +944,7 @@ class CosyVoice3Model(
         # History can omit padding rows; normalize once before either compaction.
         histories = [histories[i] if i < len(histories) else [] for i in range(batch_size)]
         generators = sampling_metadata.generators
-        mixed_batch = None
+        random_indices = None
         if not sampling_metadata.all_random:
             # Match the old Python-float comparison at the epsilon boundary.
             greedy = greedy_mask
@@ -961,7 +961,6 @@ class CosyVoice3Model(
             top_k = top_k.index_select(0, random_indices)
             histories = [histories[i] for i in random_rows]
             generators = {i: generators[row] for i, row in enumerate(random_rows) if row in generators}
-            mixed_batch = mixed_output, random_indices
         weighted_scores = torch.log_softmax(logits / temperature.clamp_min(self._sampling_eps).unsqueeze(1), dim=1)
         sorted_probs, sorted_ids = weighted_scores.softmax(dim=1).sort(dim=1, descending=True, stable=True)
         history = None
@@ -979,22 +978,20 @@ class CosyVoice3Model(
                 rows = torch.tensor(rejected_rows, device=logits.device, dtype=torch.long)
                 scores = weighted_scores.index_select(0, rows)
                 rejected_ids = sampled.index_select(0, rows).unsqueeze(1)
-                original = scores.gather(1, rejected_ids)
+                selected_scores = scores.gather(1, rejected_ids)
                 scores.scatter_(1, rejected_ids, float("-inf"))
-                replacement = torch.where(
-                    torch.isfinite(scores).any(dim=1, keepdim=True),
-                    torch.full_like(original, float("-inf")),
-                    original,
+                scores.scatter_(
+                    1,
+                    rejected_ids,
+                    torch.where(torch.isfinite(scores).any(dim=1, keepdim=True), float("-inf"), selected_scores),
                 )
-                scores.scatter_(1, rejected_ids, replacement)
                 compact_generators = {i: generators[row] for i, row in enumerate(rejected_rows) if row in generators}
                 # RAS rejection samples the complete remaining distribution,
                 # without applying top-k/top-p a second time.
-                replacement_ids = categorical_sample(scores.softmax(dim=1), compact_generators).reshape(-1).long()
+                replacement_ids = categorical_sample(scores.softmax(dim=1), compact_generators)
                 sampled.index_copy_(0, rows, replacement_ids)
         sampled = sampled.to(torch.int32)
-        if mixed_batch is not None:
-            mixed_output, random_indices = mixed_batch
+        if random_indices is not None:
             mixed_output.index_copy_(0, random_indices, sampled)
             return mixed_output
         return sampled

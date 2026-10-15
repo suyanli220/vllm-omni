@@ -31,7 +31,6 @@ def _categorical_kernel(
     window: tl.constexpr,
     history_block: tl.constexpr,
     nucleus: tl.constexpr,
-    rows: tl.constexpr,
     vocab: tl.constexpr,
     stride: tl.constexpr,
     row_threads: tl.constexpr,
@@ -93,19 +92,21 @@ def _cuda_sample(
     if any(row < 0 or row >= rows for row in generators):
         raise ValueError("generator row outside sampling batch")
 
-    def reserve(generator: torch.Generator, numel: int) -> tuple[int, int]:
-        _, increment = torch_exponential_policy(numel, probs.device)
+    row_threads, row_increment = torch_exponential_policy(vocab, probs.device)
+    batch_threads, batch_increment = torch_exponential_policy(rows * vocab, probs.device)
+
+    def reserve(generator: torch.Generator, increment: int) -> tuple[int, int]:
         seed, offset = generator.initial_seed(), generator.get_offset()
         generator.set_offset(offset + increment)
         return seed if seed < 1 << 63 else seed - (1 << 64), offset
 
-    # Per-row (seed, offset, request-owned flag), all runtime device data.
+    # Per-row (seed, offset, row-draw flag). Default draws index the full matrix.
     states = [(0, 0, 0)] * rows
     if len(generators) != rows:
         default = torch.cuda.default_generators[probs.device.index or 0]
-        states = [(*reserve(default, rows * vocab), 0)] * rows
+        states = [(*reserve(default, batch_increment), 0)] * rows
     for row, generator in generators.items():
-        states[row] = (*reserve(generator, vocab), 1)
+        states[row] = (*reserve(generator, row_increment), 1)
     # Neither changing offsets nor seeded-row membership specialize the kernel.
     state = torch.tensor(states, dtype=torch.int64, pin_memory=True).to(probs.device, non_blocking=True)
     cumulative, indices, top_p, top_k = nucleus if nucleus is not None else (None, None, None, None)
@@ -120,15 +121,14 @@ def _cuda_sample(
         history,
         rejected,
         threshold,
-        window,
-        triton.next_power_of_2(max(window, 1)),
-        nucleus is not None,
-        rows,
-        vocab,
-        probs.stride(0),
-        torch_exponential_policy(vocab, probs.device)[0],
-        torch_exponential_policy(rows * vocab, probs.device)[0],
-        triton.next_power_of_2(vocab),
+        window=window,
+        history_block=triton.next_power_of_2(max(window, 1)),
+        nucleus=nucleus is not None,
+        vocab=vocab,
+        stride=probs.stride(0),
+        row_threads=row_threads,
+        batch_threads=batch_threads,
+        block=triton.next_power_of_2(vocab),
         num_warps=4,
         enable_fp_fusion=False,
     )
@@ -147,9 +147,9 @@ def _use_triton(probs: torch.Tensor) -> bool:
 
 
 def categorical_sample(probs: torch.Tensor, generators: dict[int, torch.Generator]) -> torch.Tensor:
-    """Draw once per supplied row; replacements must supply only rejected rows."""
+    """Return an int64 token vector; replacements supply only rejected rows."""
     if not _use_triton(probs):
-        return random_sample(probs, generators)
+        return random_sample(probs, generators).reshape(-1).long()
     return _cuda_sample(probs, generators)[0]
 
 
