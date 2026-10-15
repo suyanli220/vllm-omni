@@ -34,27 +34,18 @@ def _categorical_kernel(
     rows: tl.constexpr,
     vocab: tl.constexpr,
     stride: tl.constexpr,
-    seeded_rows: tl.constexpr,
     row_threads: tl.constexpr,
     batch_threads: tl.constexpr,
     block: tl.constexpr,
 ):
     row = tl.program_id(0)
     cols = tl.arange(0, block)
-    seed = tl.load(state + row * 2).to(tl.uint64)
-    offset = tl.load(state + row * 2 + 1).to(tl.uint64)
-    if len(seeded_rows) == rows:
+    seed = tl.load(state + row * 3).to(tl.uint64)
+    offset = tl.load(state + row * 3 + 1).to(tl.uint64)
+    if tl.load(state + row * 3 + 2):
         noise = torch_exponential_noise(seed, offset, cols, row_threads)
-    elif len(seeded_rows) == 0:
-        noise = torch_exponential_noise(seed, offset, row * vocab + cols, batch_threads)
     else:
-        seeded = tl.full((), False, tl.int1)
-        for i in tl.static_range(len(seeded_rows)):
-            seeded = seeded | (row == seeded_rows[i])
-        if seeded:
-            noise = torch_exponential_noise(seed, offset, cols, row_threads)
-        else:
-            noise = torch_exponential_noise(seed, offset, row * vocab + cols, batch_threads)
+        noise = torch_exponential_noise(seed, offset, row * vocab + cols, batch_threads)
     weights = tl.load(probs + row * stride + cols, cols < vocab, other=0.0)
     if nucleus:
         cdf = tl.load(cumulative + row * vocab + cols, cols < vocab, other=0.0)
@@ -108,14 +99,15 @@ def _cuda_sample(
         generator.set_offset(offset + increment)
         return seed if seed < 1 << 63 else seed - (1 << 64), offset
 
-    states = [(0, 0)] * rows
+    # Per-row (seed, offset, request-owned flag), all runtime device data.
+    states = [(0, 0, 0)] * rows
     if len(generators) != rows:
         default = torch.cuda.default_generators[probs.device.index or 0]
-        states = [reserve(default, rows * vocab)] * rows
+        states = [(*reserve(default, rows * vocab), 0)] * rows
     for row, generator in generators.items():
-        states[row] = reserve(generator, vocab)
-    # Device data keeps changing RNG offsets out of Triton's specialization key.
-    state = torch.tensor(states, dtype=torch.int64, device=probs.device)
+        states[row] = (*reserve(generator, vocab), 1)
+    # Neither changing offsets nor seeded-row membership specialize the kernel.
+    state = torch.tensor(states, dtype=torch.int64, pin_memory=True).to(probs.device, non_blocking=True)
     cumulative, indices, top_p, top_k = nucleus if nucleus is not None else (None, None, None, None)
     _categorical_kernel[(rows,)](
         probs,
@@ -134,7 +126,6 @@ def _cuda_sample(
         rows,
         vocab,
         probs.stride(0),
-        tuple(sorted(generators)),
         torch_exponential_policy(vocab, probs.device)[0],
         torch_exponential_policy(rows * vocab, probs.device)[0],
         triton.next_power_of_2(vocab),

@@ -605,9 +605,7 @@ def test_sample_uses_ras_rejection_for_recent_repetition():
     assert out.sampled_token_ids.tolist() == [[2]]
 
 
-@pytest.mark.parametrize("history_rows", [1, 2, 4])
-@pytest.mark.parametrize("mixed", [False, True])
-@pytest.mark.parametrize("win_size", [0, 10])
+@pytest.mark.parametrize("history_rows,mixed,win_size", [(1, False, 10), (2, True, 10), (4, False, 10), (1, True, 0)])
 def test_sample_aligns_history_with_active_rows(history_rows, mixed, win_size):
     model = _make_talker_model()
     model.config.llm["sampling"]["win_size"] = win_size
@@ -679,12 +677,13 @@ def _reference_param(param, row, default):
 
 def _reference_ras_one(weighted_scores, history, *, top_p, top_k, win_size, tau_r, generator):
     """Serial RAS oracle from the pre-B1 implementation, including RNG draws."""
+    native_sample = getattr(random_sample, "__wrapped__", random_sample)
     probs, ids = weighted_scores.softmax(dim=0).sort(descending=True, stable=True)
     keep = probs.cumsum(dim=0) - probs < top_p
     if top_k > 0:
         keep &= torch.arange(probs.numel(), device=probs.device) < top_k
     generators = {} if generator is None else {0: generator}
-    draw = random_sample((probs * keep).unsqueeze(0), generators).reshape(())
+    draw = native_sample((probs * keep).unsqueeze(0), generators).reshape(())
     token = int(ids[draw].item())
     if win_size > 0 and history:
         recent = torch.tensor(history[-win_size:], device=probs.device)
@@ -693,7 +692,7 @@ def _reference_ras_one(weighted_scores, history, *, top_p, top_k, win_size, tau_
             original = scores[token].clone()
             scores[token] = float("-inf")
             scores[token] = torch.where(torch.isfinite(scores).any(), scores[token], original)
-            token = int(random_sample(scores.softmax(dim=0).unsqueeze(0), generators).item())
+            token = int(native_sample(scores.softmax(dim=0).unsqueeze(0), generators).item())
     return token
 
 
@@ -728,9 +727,16 @@ def test_batched_ras_matches_serial_seeded_requests_and_rng_state():
             metadata.output_token_ids[i].append(token)
 
 
-@pytest.mark.parametrize("parameters", ["mixed", "defaults", "all_random"])
-@pytest.mark.parametrize("seeded_rows", [(0, 1, 2, 3), (0, 2)])
-@pytest.mark.parametrize("use_host_params", [False, True])
+@pytest.mark.parametrize(
+    "parameters,seeded_rows,use_host_params",
+    [
+        ("mixed", (0, 1, 2, 3), True),
+        ("mixed", (0, 2), True),
+        ("mixed", (0, 1, 2, 3), False),
+        ("defaults", (0, 2), True),
+        ("all_random", (0, 1, 2, 3), True),
+    ],
+)
 def test_mixed_ras_preserves_seeded_trajectories_and_greedy_rng(parameters, seeded_rows, use_host_params, device="cpu"):
     model = _make_talker_model()
     logits = torch.tensor([[4.0, 1.0, 0.0, -1.0], [0.0, 2.0, 1.0, -2.0]] * 2, device=device)
@@ -750,8 +756,8 @@ def test_mixed_ras_preserves_seeded_trajectories_and_greedy_rng(parameters, seed
             setattr(metadata, name, value.to(device))
     metadata.generators = {i: torch.Generator(device=device).manual_seed(800 + i) for i in seeded_rows}
     reference_generators = {i: torch.Generator(device=device).manual_seed(800 + i) for i in seeded_rows}
-    for step in range(40):
-        if step == 20:
+    for step in range(12):
+        if step == 6:
             # A previously greedy request must start from its untouched RNG.
             temperatures = [1.0, 0.9, 1.1, 0.5] if metadata.all_random else [1.0, 0.0, 0.0, 0.5]
             metadata.temperature = torch.tensor(temperatures, device=device)

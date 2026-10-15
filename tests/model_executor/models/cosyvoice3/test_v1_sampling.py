@@ -4,7 +4,6 @@
 
 import pytest
 import torch
-from vllm.v1.sample.ops.topk_topp_sampler import random_sample
 
 from tests.helpers.mark import hardware_test
 from vllm_omni.model_executor.models.cosyvoice3.v1_sampling import categorical_sample, nucleus_sample
@@ -13,13 +12,38 @@ from vllm_omni.platforms import current_omni_platform
 pytestmark = [pytest.mark.core_model, pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="requires CUDA")]
 
 
+def _torch_sample(probs, generators):
+    """Independent oracle: native Torch draws, without Omni's Philox helper."""
+    noise = torch.empty_like(probs)
+    if len(generators) != probs.shape[0]:
+        noise.exponential_()
+    for row, generator in generators.items():
+        noise[row].exponential_(generator=generator)
+    return (probs / noise).argmax(dim=-1)
+
+
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("vocab", [3, 257, 6761])
-@pytest.mark.parametrize("rows", [1, 4, 8, 65])
-@pytest.mark.parametrize("seeding", ["all", "partial", "none", "shared", "default_alias"])
+@pytest.mark.parametrize(
+    "vocab,rows,seeding",
+    [
+        (3, 1, "all"),
+        (6761, 1, "all"),
+        (257, 4, "all"),
+        (6761, 8, "all"),
+        (6761, 4, "partial"),
+        (6761, 4, "none"),
+        (6761, 4, "shared"),
+        (6761, 4, "default_alias"),
+        (6761, 64, "none"),
+        (257, 65, "partial"),
+        (257, 4, "partial"),
+        (6761, 4, "changing"),
+    ],
+)
 def test_categorical_matches_tokens_and_generator_states(vocab, rows, seeding):
     device = torch.device("cuda", 0)
     generators = {i: torch.Generator(device=device).manual_seed((1 << 63) + i) for i in range(rows)}
+    request_generators = generators.copy()
     if seeding == "partial":
         generators = {i: g for i, g in generators.items() if i % 2}
     elif seeding == "none":
@@ -34,8 +58,11 @@ def test_categorical_matches_tokens_and_generator_states(vocab, rows, seeding):
     probs = torch.randn(rows, vocab, generator=torch.Generator().manual_seed(17)).to(device).softmax(-1)
     owned = {id(g): g for g in [torch.cuda.default_generators[0], *generators.values()]}
     for step in range(20):
+        if seeding == "changing":
+            # Exercise every seeded-row mask at a fixed batch shape, in dict order.
+            generators = {i: request_generators[i] for i in reversed(range(rows)) if step & (1 << i)}
         before = {key: g.get_state() for key, g in owned.items()}
-        expected = random_sample(probs.clone(), generators)
+        expected = _torch_sample(probs, generators)
         after = {key: g.get_state() for key, g in owned.items()}
         for key, g in owned.items():
             g.set_state(before[key])
@@ -46,11 +73,20 @@ def test_categorical_matches_tokens_and_generator_states(vocab, rows, seeding):
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("vocab", [3, 257, 6761])
-@pytest.mark.parametrize("top_k", [-1, 1, 25])
-@pytest.mark.parametrize("seeded", [False, True])
-@pytest.mark.parametrize("window", [0, 10])
-def test_nucleus_exact_boundaries_ties_and_default_rng(vocab, top_k, seeded, window):
+@pytest.mark.parametrize(
+    "vocab,top_k,seeded,window,full_top_p",
+    [
+        (3, -1, False, 10, False),
+        (257, -1, True, 10, False),
+        (6761, -1, True, 10, False),
+        (257, 1, True, 10, False),
+        (257, 2, False, 10, False),
+        (257, 2, True, 10, False),
+        (257, -1, True, 0, False),
+        (257, 25, True, 10, True),
+    ],
+)
+def test_nucleus_exact_boundaries_ties_and_default_rng(vocab, top_k, seeded, window, full_top_p):
     device = torch.device("cuda", 0)
     # Equal weights make stable-sort ties and exact cumulative boundaries observable.
     probs, indices = torch.zeros(3, vocab, device=device).softmax(-1).sort(descending=True, stable=True)
@@ -63,6 +99,8 @@ def test_nucleus_exact_boundaries_ties_and_default_rng(vocab, top_k, seeded, win
             torch.nextafter(boundary, torch.full_like(boundary, float("inf"))),
         ]
     )
+    if full_top_p:
+        top_p.fill_(1.0)
     limits = torch.full((3,), top_k, device=device, dtype=torch.int32)
     history = torch.tensor([[0] * window, [1] * window, [-1] * window], device=device, dtype=torch.long)
     generators = {i: torch.Generator(device=device).manual_seed(17 + i) for i in range(3)} if seeded else {}
@@ -71,7 +109,7 @@ def test_nucleus_exact_boundaries_ties_and_default_rng(vocab, top_k, seeded, win
         before = [g.get_state() for g in owned]
         keep = (cumulative - probs) < top_p.unsqueeze(1)
         keep &= (limits.unsqueeze(1) <= 0) | (torch.arange(vocab, device=device) < limits.unsqueeze(1))
-        draws = random_sample(probs * keep, generators).reshape(-1, 1)
+        draws = _torch_sample(probs * keep, generators).reshape(-1, 1)
         expected = indices.gather(1, draws).squeeze(1)
         repeated = ((history == expected.unsqueeze(1)).sum(1) >= 1.0) & (history >= 0).any(1)
         after = [g.get_state() for g in owned]

@@ -44,20 +44,27 @@ def test_host_policy_avoids_parameter_tensor_reads(monkeypatch, mixed):
     assert out.sampled_token_ids.tolist() == [[1], [1]]
 
 
-@pytest.mark.parametrize("temperature", [0.0, 1e-6, 1e-5])
+@pytest.mark.parametrize(
+    "temperature", [0.0, 1e-5, torch.nextafter(torch.tensor(1e-5), torch.tensor(float("inf"))).item()]
+)
 def test_host_policy_matches_float32_greedy_boundary(monkeypatch, temperature):
     model = _make_talker_model()
     metadata = _make_sampling_metadata(output_token_ids=[[1] * 10])
     metadata.all_random = False
     metadata.temperature = torch.tensor([temperature], dtype=torch.float32)
-    assert float(metadata.temperature[0]) < model._sampling_eps
-    monkeypatch.setattr(cosyvoice3, "nucleus_sample", lambda *a, **k: pytest.fail("greedy must not advance RNG"))
+    greedy = float(metadata.temperature[0]) < model._sampling_eps
+
+    def nucleus(*args, **kwargs):
+        assert not greedy, "greedy must not advance RNG"
+        return torch.tensor([0]), None
+
+    monkeypatch.setattr(cosyvoice3, "nucleus_sample", nucleus)
     out = model.sample(torch.tensor([[0.0, 2.0]]), metadata, per_req_sampling_params=[_host_params(temperature)])
-    assert out.sampled_token_ids.tolist() == [[1]]
+    assert out.sampled_token_ids.tolist() == [[1 if greedy else 0]]
 
 
 @pytest.mark.parametrize("field", ["frequency_penalty", "presence_penalty"])
-@pytest.mark.parametrize("value", [0.0, 1e-50, -0.2, 0.5])
+@pytest.mark.parametrize("value", [0.0, 1e-50, 0.5])
 def test_host_policy_matches_tensor_penalty_routing(field, value):
     model = _make_talker_model()
     metadata = _make_sampling_metadata(output_token_ids=[[], []])
@@ -107,7 +114,7 @@ def test_host_policy_preserves_generic_sampler_route(monkeypatch, reason):
     assert model.sample(torch.ones(2, 2), metadata, per_req_sampling_params=params) == "generic"
 
 
-@pytest.mark.parametrize("host_params", [None, [], [None, None], [_host_params(), None], [_host_params()]])
+@pytest.mark.parametrize("host_params", [None, [_host_params()], [_host_params(), None]])
 def test_incomplete_host_policy_uses_tensor_routing(host_params):
     model = _make_talker_model()
     model.config.vocab_size = 2

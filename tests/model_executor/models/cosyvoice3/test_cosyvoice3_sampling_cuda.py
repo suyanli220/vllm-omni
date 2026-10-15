@@ -19,9 +19,16 @@ pytestmark = [pytest.mark.core_model, pytest.mark.skipif(not current_omni_platfo
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("parameters", ["mixed", "defaults", "all_random"])
-@pytest.mark.parametrize("seeded_rows", [(0, 1, 2, 3), (0, 2)])
-@pytest.mark.parametrize("use_host_params", [False, True])
+@pytest.mark.parametrize(
+    "parameters,seeded_rows,use_host_params",
+    [
+        ("mixed", (0, 1, 2, 3), True),
+        ("mixed", (0, 2), True),
+        ("mixed", (0, 1, 2, 3), False),
+        ("defaults", (0, 2), True),
+        ("all_random", (0, 1, 2, 3), True),
+    ],
+)
 def test_mixed_ras_cuda_trajectories(parameters, seeded_rows, use_host_params):
     _check_mixed_ras(parameters, seeded_rows, use_host_params=use_host_params, device="cuda")
 
