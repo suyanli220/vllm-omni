@@ -5,8 +5,10 @@
 Both nucleus sampling and compacted RAS replacements use this primitive.
 Probability construction stays in ATen to preserve nucleus boundaries. RNG
 reservation normally stays on the host because V1 owns torch.Generators.
-The synchronous runner can defer replacement reservations until token feedback.
+The runner can defer replacement reservations until token feedback.
 """
+
+from threading import Lock
 
 import torch
 from vllm.triton_utils import tl, triton
@@ -325,3 +327,41 @@ def commit_rejection_rng(
         if row in generators:
             generator = generators[row]
             generator.set_offset(generator.get_offset() + increment)
+
+
+class DeferredRejection:
+    """One step's RNG commit, shared by token consumption and the next sample.
+
+    This owns generator references across batch compaction/removal. The output
+    consumer and runner may race; the lock makes the commit exactly once.
+    """
+
+    def __init__(self, rejected: torch.Tensor, generators: dict[int, torch.Generator], vocab: int):
+        self.rejected = rejected
+        self.generators = generators.copy()
+        self.vocab = vocab
+        self.host: torch.Tensor | None = None
+        self.ready: torch.Event | None = None
+        self._lock = Lock()
+        self._committed = False
+
+    def stage(self, stream: torch.cuda.Stream, ready: torch.Event) -> None:
+        # Token copies are already queued on this stream. Extend their existing
+        # event to cover flags, without waiting or changing token allocation.
+        self.host = torch.empty(self.rejected.shape, dtype=self.rejected.dtype, pin_memory=True)
+        self.ready = ready
+        with torch.cuda.stream(stream):
+            self.host.copy_(self.rejected, non_blocking=True)
+            ready.record()
+
+    def commit(self, *, ready: bool = False) -> None:
+        with self._lock:
+            if self._committed:
+                return
+            assert self.host is not None and self.ready is not None
+            # History/output consumption normally already waited. Requests with
+            # no token-history dependency still must commit before reusing RNG.
+            if not ready and not self.ready.query():
+                self.ready.synchronize()
+            commit_rejection_rng(self.host.tolist(), self.generators, self.vocab, self.rejected.device)
+            self._committed = True

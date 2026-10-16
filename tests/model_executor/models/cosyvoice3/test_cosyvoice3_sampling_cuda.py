@@ -148,3 +148,75 @@ def test_deferred_ras_trajectory_and_token_feedback(monkeypatch, seeded_rows):
 
     monkeypatch.setattr(CosyVoice3Model, "sample", deferred)
     _check_mixed_ras("mixed", seeded_rows, use_host_params=True, device="cuda")
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("consumer", ["history", "output"])
+def test_async_feedback_commits_rng_once_at_token_consumption(consumer):
+    from types import SimpleNamespace
+
+    from vllm.v1.worker.gpu_input_batch import InputBatch
+    from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput
+
+    from tests.model_executor.models.cosyvoice3.test_cosyvoice3_model_helpers import (
+        _make_sampling_metadata,
+        _make_talker_model,
+    )
+    from vllm_omni.worker.gpu_ar_model_runner import _SamplingFeedbackOutput
+
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[0] * 10, [0] * 10])
+    for name in ("temperature", "top_p", "top_k", "frequency_penalties", "presence_penalties", "repetition_penalties"):
+        setattr(metadata, name, getattr(metadata, name).cuda())
+    metadata.top_k.fill_(1)
+    generator = torch.Generator(device="cuda").manual_seed(71)
+    metadata.generators = {0: generator}
+    default = torch.cuda.default_generators[torch.accelerator.current_device_index()]
+    original = default.get_state()
+    before = (generator.get_state(), default.get_state())
+    logits = torch.tensor([[3.0, 1.0, 0.0]] * 2, device="cuda")
+    try:
+        reference = model.sample(logits.clone(), metadata).sampled_token_ids.cpu()
+        # Match the runner's existing discarded-request rollback ordering.
+        generator.set_offset(generator.get_offset() - 4)
+        expected = (generator.get_state(), default.get_state())
+        generator.set_state(before[0])
+        default.set_state(before[1])
+        output = model.sample(logits.clone(), metadata, defer_rng=True)
+        generator.set_offset(generator.get_offset() - 4)
+        # Pending feedback must retain ownership if the live batch is compacted.
+        metadata.generators.clear()
+        stream = torch.cuda.Stream()
+        wrapped = AsyncGPUModelRunnerOutput(
+            model_runner_output=SimpleNamespace(),
+            sampled_token_ids=output.sampled_token_ids,
+            logprobs_tensors=None,
+            invalid_req_indices=[],
+            async_output_copy_stream=stream,
+            vocab_size=3,
+        )
+        feedback = model.stage_deferred_sampling(stream, wrapped.async_copy_ready_event)
+        result = _SamplingFeedbackOutput(wrapped, feedback)
+        metadata.output_token_ids = [[-1], [-1]]
+        batch = SimpleNamespace(
+            sampling_metadata=metadata,
+            sampled_token_ids_cpu=wrapped.sampled_token_ids_cpu,
+            async_copy_ready_event=wrapped.async_copy_ready_event,
+            prev_req_id_to_index={"a": 0, "b": 1},
+            req_ids=["a", "b"],
+        )
+        if consumer == "history":
+            InputBatch.update_async_output_token_ids(batch)
+            model.commit_deferred_sampling()
+            actual = result.get_output().sampled_token_ids
+        else:
+            actual = result.get_output().sampled_token_ids
+            InputBatch.update_async_output_token_ids(batch)
+            model.commit_deferred_sampling()
+        feedback.commit()
+        assert actual == reference.tolist() == metadata.output_token_ids
+        assert torch.equal(generator.get_state(), expected[0])
+        assert torch.equal(default.get_state(), expected[1])
+        assert model._pending_rejection_rng is None
+    finally:
+        default.set_state(original)

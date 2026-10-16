@@ -60,9 +60,9 @@ from vllm_omni.model_executor.models.cosyvoice3.utils import (
     unpad_prompt_conditioning,
 )
 from vllm_omni.model_executor.models.cosyvoice3.v1_sampling import (
+    DeferredRejection,
     _use_triton,
     categorical_sample,
-    commit_rejection_rng,
     conditional_sample,
     nucleus_sample,
 )
@@ -933,7 +933,7 @@ class CosyVoice3Model(
         callers without it read the mask once per mixed batch. The all-random
         path needs neither. Compact row indices retain request-owned generators
         and histories; greedy generators must not advance.
-        Immediate callers compact rejection on the host; the synchronous runner
+        Immediate callers compact rejection on the host; the runner
         instead commits conditional RNG consumption with final-token feedback.
         Both paths preserve generator ownership and rejected-only RNG draws.
         """
@@ -983,7 +983,7 @@ class CosyVoice3Model(
         )
         if repeated is not None and defer_rng and _use_triton(weighted_scores):
             sampled = conditional_sample(weighted_scores, sampled, repeated, generators)
-            self._pending_rejection_rng = (repeated, generators, weighted_scores.shape[1])
+            self._pending_rejection_rng = DeferredRejection(repeated, generators, weighted_scores.shape[1])
         elif repeated is not None:
             rejected_rows = [i for i, reject in enumerate(repeated.tolist()) if reject]
             if rejected_rows:
@@ -1109,8 +1109,7 @@ class CosyVoice3Model(
         pending = getattr(self, "_pending_rejection_rng", None)
         if pending is None:
             return
-        rejected, generators, vocab = pending
-        payload = torch.cat((sampled_token_ids.reshape(-1), rejected.to(sampled_token_ids.dtype)))
+        payload = torch.cat((sampled_token_ids.reshape(-1), pending.rejected.to(sampled_token_ids.dtype)))
         host = torch.empty(payload.shape, dtype=payload.dtype, pin_memory=True)
         host.copy_(payload, non_blocking=True)
         ready = torch.Event()
@@ -1118,9 +1117,23 @@ class CosyVoice3Model(
         ready.synchronize()
         values = host.tolist()
         count = sampled_token_ids.numel()
-        commit_rejection_rng(values[count:], generators, vocab, sampled_token_ids.device)
+        pending.host = host[count:]
+        pending.ready = ready
+        pending.commit(ready=True)
         self._pending_rejection_rng = None
         self._sampled_token_feedback = (sampled_token_ids, [[token] for token in values[:count]])
+
+    def stage_deferred_sampling(self, stream: torch.cuda.Stream, ready: torch.Event) -> DeferredRejection | None:
+        pending = getattr(self, "_pending_rejection_rng", None)
+        if pending is not None:
+            pending.stage(stream, ready)
+        return pending
+
+    def commit_deferred_sampling(self) -> None:
+        pending = getattr(self, "_pending_rejection_rng", None)
+        if pending is not None:
+            pending.commit()
+            self._pending_rejection_rng = None
 
     def consume_sampled_token_ids_cpu_override(self, sampled_token_ids: torch.Tensor) -> list[list[int]] | None:
         feedback = getattr(self, "_sampled_token_feedback", None)
