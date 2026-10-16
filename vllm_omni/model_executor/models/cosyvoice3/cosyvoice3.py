@@ -1059,8 +1059,13 @@ class CosyVoice3Model(
         speech_head_size = int(self.config.llm["speech_token_size"]) + 200
         logits = logits[..., :speech_head_size]
         finite_logits = torch.isfinite(logits)
-        if not finite_logits.any(dim=-1).all().item():
-            raise ValueError("CosyVoice3 sampling received a row with no finite logits")
+        valid_logits = finite_logits.any(dim=-1).all()
+        error_msg = "CosyVoice3 sampling received a row with no finite logits"
+        if logits.is_cuda:
+            # Keep this check asynchronous; a failed assert invalidates the CUDA context.
+            torch._assert_async(valid_logits, error_msg)
+        elif not valid_logits:
+            raise ValueError(error_msg)
         logits.masked_fill_(~finite_logits, float("-inf"))
 
         sampling_cfg = dict(self.config.llm.get("sampling", {}))
