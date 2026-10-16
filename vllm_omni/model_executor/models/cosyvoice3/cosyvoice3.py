@@ -59,7 +59,13 @@ from vllm_omni.model_executor.models.cosyvoice3.utils import (
     mel_spectrogram,
     unpad_prompt_conditioning,
 )
-from vllm_omni.model_executor.models.cosyvoice3.v1_sampling import categorical_sample, nucleus_sample
+from vllm_omni.model_executor.models.cosyvoice3.v1_sampling import (
+    _use_triton,
+    categorical_sample,
+    commit_rejection_rng,
+    conditional_sample,
+    nucleus_sample,
+)
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.transformers_utils.configs.cosyvoice3 import CosyVoice3Config
@@ -744,6 +750,8 @@ class CosyVoice3Model(
     supports_embed_input_ids_query_start_loc = True
     prefer_model_sampler = True
     model_sampler_wants_sampling_params = True
+    model_sampler_can_defer_rng = True
+    supports_sampled_token_ids_cpu_override = True
     _sampling_eps = 1e-5
 
     @property
@@ -917,6 +925,7 @@ class CosyVoice3Model(
         win_size: int,
         tau_r: float,
         greedy_mask: list[bool] | None = None,
+        defer_rng: bool = False,
     ) -> torch.Tensor:
         """Batch RAS, excluding greedy rows from all RNG draws.
 
@@ -924,9 +933,9 @@ class CosyVoice3Model(
         callers without it read the mask once per mixed batch. The all-random
         path needs neither. Compact row indices retain request-owned generators
         and histories; greedy generators must not advance.
-        Rejection flags cross to the host once per batch so only requests that
-        actually reject a token consume a second RNG draw. Per-request seeded
-        generators retain their ownership when rejection compacts the batch.
+        Immediate callers compact rejection on the host; the synchronous runner
+        instead commits conditional RNG consumption with final-token feedback.
+        Both paths preserve generator ownership and rejected-only RNG draws.
         """
         batch_size = logits.shape[0]
 
@@ -972,7 +981,10 @@ class CosyVoice3Model(
         sampled, repeated = nucleus_sample(
             sorted_probs, sorted_ids, top_p, top_k, history, win_size * tau_r, generators
         )
-        if repeated is not None:
+        if repeated is not None and defer_rng and _use_triton(weighted_scores):
+            sampled = conditional_sample(weighted_scores, sampled, repeated, generators)
+            self._pending_rejection_rng = (repeated, generators, weighted_scores.shape[1])
+        elif repeated is not None:
             rejected_rows = [i for i, reject in enumerate(repeated.tolist()) if reject]
             if rejected_rows:
                 rows = torch.tensor(rejected_rows, device=logits.device, dtype=torch.long)
@@ -1002,6 +1014,7 @@ class CosyVoice3Model(
         sampling_metadata: SamplingMetadata,
         *,
         per_req_sampling_params: list[SamplingParams | None] | None = None,
+        defer_rng: bool = False,
     ) -> SamplerOutput | None:
         if logits is None or logits.numel() == 0:
             return None
@@ -1087,8 +1100,37 @@ class CosyVoice3Model(
             win_size=win_size,
             tau_r=tau_r,
             greedy_mask=greedy_mask,
+            defer_rng=defer_rng,
         )
         return SamplerOutput(sampled_token_ids=sampled.unsqueeze(-1), logprobs_tensors=None)
+
+    def finalize_deferred_sampling(self, sampled_token_ids: torch.Tensor) -> None:
+        """Share one feedback copy/wait for tokens and conditional RNG commits."""
+        pending = getattr(self, "_pending_rejection_rng", None)
+        if pending is None:
+            return
+        rejected, generators, vocab = pending
+        payload = torch.cat((sampled_token_ids.reshape(-1), rejected.to(sampled_token_ids.dtype)))
+        host = torch.empty(payload.shape, dtype=payload.dtype, pin_memory=True)
+        host.copy_(payload, non_blocking=True)
+        ready = torch.Event()
+        ready.record()
+        ready.synchronize()
+        values = host.tolist()
+        count = sampled_token_ids.numel()
+        commit_rejection_rng(values[count:], generators, vocab, sampled_token_ids.device)
+        self._pending_rejection_rng = None
+        self._sampled_token_feedback = (sampled_token_ids, [[token] for token in values[:count]])
+
+    def consume_sampled_token_ids_cpu_override(self, sampled_token_ids: torch.Tensor) -> list[list[int]] | None:
+        feedback = getattr(self, "_sampled_token_feedback", None)
+        if feedback is None:
+            return None
+        self._sampled_token_feedback = None
+        tensor, tokens = feedback
+        if tensor is not sampled_token_ids:
+            raise RuntimeError("CosyVoice3 sampled-token feedback belongs to another step")
+        return tokens
 
     def mrv2_custom_sampler(self, sampler: Any) -> None:
         """Model Runner V2: the V1 sampling policies on the MRv2 sampler.

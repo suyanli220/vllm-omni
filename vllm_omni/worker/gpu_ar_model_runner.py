@@ -1403,6 +1403,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     prepared_sampling_metadata,
                     input_batch=self.input_batch,
                     requests=getattr(self, "requests", None),
+                    defer_rng=not getattr(self, "use_async_scheduling", False),
                 )
                 if sampler_output is not None:
                     return sampler_output
@@ -2058,6 +2059,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
+        # Commit conditional RNG before bookkeeping can roll back discarded draws.
+        finalize_sampling = getattr(self.model, "finalize_deferred_sampling", None)
+        if not self.use_async_scheduling and callable(finalize_sampling):
+            finalize_sampling(sampler_output.sampled_token_ids)
         self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
         if self.use_async_scheduling:
             pp = get_pp_group()

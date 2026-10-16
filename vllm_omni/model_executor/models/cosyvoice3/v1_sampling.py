@@ -4,8 +4,8 @@
 
 Both nucleus sampling and compacted RAS replacements use this primitive.
 Probability construction stays in ATen to preserve nucleus boundaries. RNG
-reservation stays on the host because V1 owns ordinary torch.Generators;
-callers must compact rejected rows before requesting replacement draws.
+reservation normally stays on the host because V1 owns torch.Generators.
+The synchronous runner can defer replacement reservations until token feedback.
 """
 
 import torch
@@ -28,6 +28,8 @@ def _categorical_kernel(
     history,
     rejected,
     threshold,
+    replacement_plan,
+    active,
     window: tl.constexpr,
     history_block: tl.constexpr,
     nucleus: tl.constexpr,
@@ -38,13 +40,23 @@ def _categorical_kernel(
     block: tl.constexpr,
 ):
     row = tl.program_id(0)
+    if active is not None:
+        if not tl.load(active + row):
+            return
     cols = tl.arange(0, block)
-    seed = tl.load(state + row * 3).to(tl.uint64)
-    offset = tl.load(state + row * 3 + 1).to(tl.uint64)
-    if tl.load(state + row * 3 + 2):
-        noise = torch_exponential_noise(seed, offset, cols, row_threads)
+    if replacement_plan is not None:
+        seed = tl.load(replacement_plan + row * 4).to(tl.uint64)
+        offset = tl.load(replacement_plan + row * 4 + 1).to(tl.uint64)
+        threads = tl.load(replacement_plan + row * 4 + 2)
+        start = tl.load(replacement_plan + row * 4 + 3)
+        noise = torch_exponential_noise(seed, offset, start + cols, threads)
     else:
-        noise = torch_exponential_noise(seed, offset, row * vocab + cols, batch_threads)
+        seed = tl.load(state + row * 3).to(tl.uint64)
+        offset = tl.load(state + row * 3 + 1).to(tl.uint64)
+        if tl.load(state + row * 3 + 2):
+            noise = torch_exponential_noise(seed, offset, cols, row_threads)
+        else:
+            noise = torch_exponential_noise(seed, offset, row * vocab + cols, batch_threads)
     weights = tl.load(probs + row * stride + cols, cols < vocab, other=0.0)
     if nucleus:
         cdf = tl.load(cumulative + row * vocab + cols, cols < vocab, other=0.0)
@@ -121,6 +133,8 @@ def _cuda_sample(
         history,
         rejected,
         threshold,
+        None,
+        None,
         window=window,
         history_block=triton.next_power_of_2(max(window, 1)),
         nucleus=nucleus is not None,
@@ -181,3 +195,133 @@ def nucleus_sample(
     if history is not None:
         repeated = ((history == sampled.unsqueeze(1)).sum(dim=1) >= threshold) & (history >= 0).any(dim=1)
     return sampled, repeated
+
+
+@triton.jit
+def _replacement_plan_kernel(
+    rejected,
+    snapshots,
+    plan,
+    rows: tl.constexpr,
+    vocab: tl.constexpr,
+    block: tl.constexpr,
+    row_threads: tl.constexpr,
+    row_increment: tl.constexpr,
+    max_threads: tl.constexpr,
+):
+    row = tl.program_id(0)
+    if not tl.load(rejected + row):
+        return
+    positions = tl.arange(0, block)
+    valid = positions < rows
+    active = tl.load(rejected + positions, valid, other=0)
+    groups = tl.load(snapshots + positions * 4 + 2, valid, other=-1)
+    seeded = tl.load(snapshots + positions * 4 + 3, valid, other=0)
+    count = tl.sum(active.to(tl.int32), 0)
+    rank = tl.sum((active & (positions < row)).to(tl.int32), 0)
+    # Torch reserves a matrix for *all* compacted rows if any is unseeded.
+    batch_threads = tl.minimum(max_threads, tl.cdiv(count * vocab, 256) * 256)
+    batch_increment = tl.cdiv(count * vocab, batch_threads * 4) * 4
+    uses_default = tl.sum((active & (seeded == 0)).to(tl.int32), 0) > 0
+    group = tl.load(snapshots + row * 4 + 2)
+    is_seeded = tl.load(snapshots + row * 4 + 3) != 0
+    offset = tl.load(snapshots + row * 4 + 1)
+    if is_seeded:
+        preceding = tl.sum((active & (seeded != 0) & (groups == group) & (positions < row)).to(tl.int32), 0)
+        offset += preceding * row_increment + tl.where((group == 0) & uses_default, batch_increment, 0)
+    tl.store(plan + row * 4, tl.load(snapshots + row * 4))
+    tl.store(plan + row * 4 + 1, offset)
+    tl.store(plan + row * 4 + 2, tl.where(is_seeded, row_threads, batch_threads))
+    tl.store(plan + row * 4 + 3, tl.where(is_seeded, 0, rank * vocab))
+
+
+def conditional_sample(
+    scores: torch.Tensor,
+    sampled: torch.Tensor,
+    rejected: torch.Tensor,
+    generators: dict[int, torch.Generator],
+) -> torch.Tensor:
+    """Sample rejected rows without advancing host generators until feedback.
+
+    Snapshots follow the initial draw. Group zero is the default generator;
+    compacted request draws follow ascending row order, including aliases.
+    """
+    rows, vocab = scores.shape
+    default = torch.cuda.default_generators[scores.device.index or 0]
+    groups = {id(default): 0}
+    snapshots = []
+    for row in range(rows):
+        generator = generators.get(row, default)
+        group = groups.setdefault(id(generator), len(groups))
+        seed = generator.initial_seed()
+        snapshots.append(
+            (seed if seed < 1 << 63 else seed - (1 << 64), generator.get_offset(), group, row in generators)
+        )
+    state = torch.tensor(snapshots, dtype=torch.int64, pin_memory=True).to(scores.device, non_blocking=True)
+    plan = torch.empty((rows, 4), dtype=torch.int64, device=scores.device)
+    row_threads, row_increment = torch_exponential_policy(vocab, scores.device)
+    props = torch.cuda.get_device_properties(scores.device)
+    _replacement_plan_kernel[(rows,)](
+        rejected,
+        state,
+        plan,
+        rows,
+        vocab,
+        triton.next_power_of_2(rows),
+        row_threads,
+        row_increment,
+        props.multi_processor_count * (props.max_threads_per_multi_processor // 256) * 256,
+    )
+    # Preserve ATen's probability construction, including the sole-candidate fallback.
+    scores = scores.clone()
+    ids = sampled.unsqueeze(1)
+    selected = scores.gather(1, ids)
+    scores.scatter_(1, ids, float("-inf"))
+    scores.scatter_(1, ids, torch.where(torch.isfinite(scores).any(1, keepdim=True), float("-inf"), selected))
+    probs = scores.softmax(1)
+    _categorical_kernel[(rows,)](
+        probs,
+        None,
+        sampled,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        0.0,
+        plan,
+        rejected,
+        window=0,
+        history_block=1,
+        nucleus=False,
+        vocab=vocab,
+        stride=probs.stride(0),
+        row_threads=0,
+        batch_threads=0,
+        block=triton.next_power_of_2(vocab),
+        num_warps=4,
+        enable_fp_fusion=False,
+    )
+    return sampled
+
+
+def commit_rejection_rng(
+    rejected: list[bool],
+    generators: dict[int, torch.Generator],
+    vocab: int,
+    device: torch.device,
+) -> None:
+    """Commit the same reservations as a native compacted replacement draw."""
+    rows = [row for row, active in enumerate(rejected) if active]
+    if not rows:
+        return
+    if any(row not in generators for row in rows):
+        default = torch.cuda.default_generators[device.index or 0]
+        increment = torch_exponential_policy(len(rows) * vocab, device)[1]
+        default.set_offset(default.get_offset() + increment)
+    increment = torch_exponential_policy(vocab, device)[1]
+    for row in rows:
+        if row in generators:
+            generator = generators[row]
+            generator.set_offset(generator.get_offset() + increment)

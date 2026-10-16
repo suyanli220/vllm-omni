@@ -91,6 +91,7 @@ def call_model_sampler(
     *,
     input_batch: Any,
     requests: Any,
+    defer_rng: bool = False,
 ) -> Any:
     """Call an opted-in model sampler with per-request host arguments.
 
@@ -110,6 +111,8 @@ def call_model_sampler(
             getattr(request_states.get(req_id), "sampling_params", None)
             for req_id in getattr(input_batch, "req_ids", [])
         ]
+    if defer_rng and getattr(model, "model_sampler_can_defer_rng", False):
+        kwargs["defer_rng"] = True
     return model_sample(logits, sampling_metadata, **kwargs)
 
 
