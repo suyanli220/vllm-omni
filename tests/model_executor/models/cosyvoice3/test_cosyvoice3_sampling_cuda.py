@@ -220,3 +220,52 @@ def test_async_feedback_commits_rng_once_at_token_consumption(consumer):
         assert model._pending_rejection_rng is None
     finally:
         default.set_state(original)
+
+
+@hardware_test(res={"cuda": "L4"}, num_cards=1)
+@pytest.mark.parametrize("vocab", [2049, 6761, 8193, 9216])
+def test_rejected_probability_preparation_matches_aten_bits(vocab):
+    from vllm.triton_utils import triton
+
+    from vllm_omni.model_executor.models.cosyvoice3.v1_sampling import _prepare_replacement_kernel
+    from vllm_omni.utils.seeded_exponential import torch_exponential_policy
+
+    scores = torch.sin(torch.arange(5 * vocab, device="cuda").reshape(5, vocab).float())
+    scores[1].zero_()
+    scores[2] = torch.linspace(-1000, 0, vocab, device="cuda")
+    scores[3].fill_(-float("inf"))
+    scores[3, 3] = 0
+    picked = torch.arange(5, device="cuda")
+    rejected = torch.tensor([True, True, True, True, False], device="cuda")
+    snapshots = torch.zeros((5, 4), dtype=torch.int64, device="cuda")
+    plan = torch.empty((5, 4), dtype=torch.int64, device="cuda")
+    probs = torch.full_like(scores, float("nan"))
+    threads, increment = torch_exponential_policy(vocab, scores.device)
+    props = torch.cuda.get_device_properties(scores.device)
+    _prepare_replacement_kernel[(5,)](
+        rejected,
+        snapshots,
+        plan,
+        scores,
+        picked,
+        probs,
+        True,
+        triton.next_power_of_2(vocab),
+        5,
+        vocab,
+        8,
+        threads,
+        increment,
+        props.multi_processor_count * (props.max_threads_per_multi_processor // 256) * 256,
+        num_warps=32,
+        enable_fp_fusion=False,
+    )
+    # Independent ATen oracle, including the sole-finite-candidate fallback.
+    masked = scores.clone()
+    selected = masked.gather(1, picked[:, None])
+    masked.scatter_(1, picked[:, None], -float("inf"))
+    masked.scatter_(
+        1, picked[:, None], torch.where(torch.isfinite(masked).any(1, keepdim=True), -float("inf"), selected)
+    )
+    assert torch.equal(probs[:4], masked.softmax(1)[:4])
+    assert torch.isnan(probs[4]).all()  # Accepted rows never prepare probabilities.

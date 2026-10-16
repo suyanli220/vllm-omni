@@ -3,7 +3,7 @@
 """V1 categorical draws with Torch-compatible Philox streams.
 
 Both nucleus sampling and compacted RAS replacements use this primitive.
-Probability construction stays in ATen to preserve nucleus boundaries. RNG
+Nucleus probabilities stay in ATen to preserve filtering boundaries. RNG
 reservation normally stays on the host because V1 owns torch.Generators.
 The runner can defer replacement reservations until token feedback.
 """
@@ -200,10 +200,15 @@ def nucleus_sample(
 
 
 @triton.jit
-def _replacement_plan_kernel(
+def _prepare_replacement_kernel(
     rejected,
     snapshots,
     plan,
+    scores,
+    sampled,
+    probs,
+    prepare_probs: tl.constexpr,
+    vocab_block: tl.constexpr,
     rows: tl.constexpr,
     vocab: tl.constexpr,
     block: tl.constexpr,
@@ -236,6 +241,27 @@ def _replacement_plan_kernel(
     tl.store(plan + row * 4 + 2, tl.where(is_seeded, row_threads, batch_threads))
     tl.store(plan + row * 4 + 3, tl.where(is_seeded, 0, rank * vocab))
 
+    if prepare_probs:
+        cols = tl.arange(0, vocab_block)
+        values = tl.load(scores + row * vocab + cols, cols < vocab, other=-float("inf"))
+        selected = tl.load(sampled + row)
+        has_other = tl.sum(((cols < vocab) & (cols != selected) & (values > -float("inf"))).to(tl.int32), 0) > 0
+        values = tl.where((cols == selected) & has_other, -float("inf"), values)
+        maximum = tl.max(values, 0)
+        # ATen cunn_SoftMaxForwardReg: 1024 lanes, sequential register sums,
+        # then warp and block reductions. Keep normalization and expf/div.rn.
+        lanes = tl.arange(0, 1024)
+        partial = tl.full((1024,), 0.0, tl.float32)
+        for register in tl.static_range(triton.cdiv(vocab, 1024)):
+            positions = lanes + register * 1024
+            value = tl.load(scores + row * vocab + positions, positions < vocab, other=-float("inf"))
+            value = tl.where((positions == selected) & has_other, -float("inf"), value)
+            term = tl.extra.cuda.libdevice.exp(value - maximum)
+            partial = partial + tl.where(positions < vocab, term, 0.0)
+        denominator = tl.sum(partial, 0)
+        weights = tl.div_rn(tl.extra.cuda.libdevice.exp(values - maximum), denominator)
+        tl.store(probs + row * vocab + cols, weights, cols < vocab)
+
 
 def conditional_sample(
     scores: torch.Tensor,
@@ -248,6 +274,7 @@ def conditional_sample(
     Snapshots follow the initial draw. Group zero is the default generator;
     compacted request draws follow ascending row order, including aliases.
     """
+    scores = scores.contiguous()
     rows, vocab = scores.shape
     default = torch.cuda.default_generators[scores.device.index or 0]
     groups = {id(default): 0}
@@ -263,24 +290,35 @@ def conditional_sample(
     plan = torch.empty((rows, 4), dtype=torch.int64, device=scores.device)
     row_threads, row_increment = torch_exponential_policy(vocab, scores.device)
     props = torch.cuda.get_device_properties(scores.device)
-    _replacement_plan_kernel[(rows,)](
+    # Match ATen's register softmax branch. Other vocabulary sizes retain ATen.
+    prepare_probs = 2048 < vocab <= 9216
+    probs = torch.empty_like(scores) if prepare_probs else None
+    _prepare_replacement_kernel[(rows,)](
         rejected,
         state,
         plan,
+        scores,
+        sampled,
+        probs,
+        prepare_probs,
+        triton.next_power_of_2(vocab),
         rows,
         vocab,
         triton.next_power_of_2(rows),
         row_threads,
         row_increment,
         props.multi_processor_count * (props.max_threads_per_multi_processor // 256) * 256,
+        num_warps=32 if prepare_probs else 4,
+        enable_fp_fusion=False,
     )
-    # Preserve ATen's probability construction, including the sole-candidate fallback.
-    scores = scores.clone()
-    ids = sampled.unsqueeze(1)
-    selected = scores.gather(1, ids)
-    scores.scatter_(1, ids, float("-inf"))
-    scores.scatter_(1, ids, torch.where(torch.isfinite(scores).any(1, keepdim=True), float("-inf"), selected))
-    probs = scores.softmax(1)
+    if not prepare_probs:
+        # Preserve ATen outside the verified register-softmax branch.
+        scores = scores.clone()
+        ids = sampled.unsqueeze(1)
+        selected = scores.gather(1, ids)
+        scores.scatter_(1, ids, float("-inf"))
+        scores.scatter_(1, ids, torch.where(torch.isfinite(scores).any(1, keepdim=True), float("-inf"), selected))
+        probs = scores.softmax(1)
     _categorical_kernel[(rows,)](
         probs,
         None,
