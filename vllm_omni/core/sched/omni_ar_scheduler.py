@@ -563,7 +563,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             status_before_stop = request.status
             new_logprobs = None
-            logprob_validation_failed = False
+            sampling_validation_failed = False
+            if req_id in getattr(model_runner_output, "invalid_logits_req_ids", ()):
+                request.status = RequestStatus.FINISHED_ERROR
+                request.stop_reason = "CosyVoice3 sampling received a row with no finite logits"
+                request.resumable = False
+                generated_token_ids = []
+                sampling_validation_failed = True
 
             # Validate before mutating request token state. A bad runner output
             # is request-local: terminate only this request and keep processing
@@ -581,7 +587,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     request.stop_reason = str(exc)
                     request.resumable = False
                     generated_token_ids = []
-                    logprob_validation_failed = True
+                    sampling_validation_failed = True
 
             scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
             if scheduled_spec_token_ids and generated_token_ids:
@@ -612,13 +618,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if request.has_encoder_inputs:
                 self._free_encoder_inputs(request)
 
-            stopped = logprob_validation_failed
+            stopped = sampling_validation_failed
             is_segment_finished = False
             finished = False
             new_token_ids = generated_token_ids
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
             mm_output = mm_outputs[req_index] if mm_outputs else None
             inter_stage_output = inter_stage_outputs[req_index] if inter_stage_outputs else None
+            if sampling_validation_failed:
+                pooler_output = mm_output = inter_stage_output = None
             kv_transfer_params = None
             ec_transfer_params = None
             finish_reason = None
