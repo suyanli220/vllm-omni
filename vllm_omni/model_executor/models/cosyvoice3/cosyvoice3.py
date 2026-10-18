@@ -1072,14 +1072,15 @@ class CosyVoice3Model(
         speech_head_size = int(self.config.llm["speech_token_size"]) + 200
         logits = logits[..., :speech_head_size]
         finite_logits = torch.isfinite(logits)
-        valid_logits = finite_logits.any(dim=-1).all()
+        valid_rows = finite_logits.any(dim=-1)
         error_msg = "CosyVoice3 sampling received a row with no finite logits"
-        if logits.is_cuda:
-            # Keep this check asynchronous; a failed assert invalidates the CUDA context.
-            torch._assert_async(valid_logits, error_msg)
-        elif not valid_logits:
+        if not (defer_rng and logits.is_cuda) and not valid_rows.all():
             raise ValueError(error_msg)
         logits.masked_fill_(~finite_logits, float("-inf"))
+        if defer_rng and logits.is_cuda:
+            # Invalid rows produce a safe placeholder until request-local error
+            # handling at token consumption. Never publish it as a sampled token.
+            logits[:, 0] = torch.where(valid_rows, logits[:, 0], 0.0)
 
         sampling_cfg = dict(self.config.llm.get("sampling", {}))
         default_top_p = float(sampling_cfg.get("top_p", 0.8))
@@ -1102,14 +1103,20 @@ class CosyVoice3Model(
             greedy_mask=greedy_mask,
             defer_rng=defer_rng,
         )
+        if defer_rng and logits.is_cuda:
+            pending = getattr(self, "_pending_rejection_rng", None)
+            if pending is None:
+                pending = DeferredRejection(torch.empty(0, dtype=torch.bool, device=logits.device), {}, logits.shape[1])
+                self._pending_rejection_rng = pending
+            pending.invalid_logits = ~valid_rows
         return SamplerOutput(sampled_token_ids=sampled.unsqueeze(-1), logprobs_tensors=None)
 
-    def finalize_deferred_sampling(self, sampled_token_ids: torch.Tensor) -> None:
+    def finalize_deferred_sampling(self, sampled_token_ids: torch.Tensor) -> DeferredRejection | None:
         """Share one feedback copy/wait for tokens and conditional RNG commits."""
         pending = getattr(self, "_pending_rejection_rng", None)
         if pending is None:
             return
-        payload = torch.cat((sampled_token_ids.reshape(-1), pending.rejected.to(sampled_token_ids.dtype)))
+        payload = torch.cat((sampled_token_ids.reshape(-1), pending.flags().to(sampled_token_ids.dtype)))
         host = torch.empty(payload.shape, dtype=payload.dtype, pin_memory=True)
         host.copy_(payload, non_blocking=True)
         ready = torch.Event()
@@ -1122,6 +1129,7 @@ class CosyVoice3Model(
         pending.commit(ready=True)
         self._pending_rejection_rng = None
         self._sampled_token_feedback = (sampled_token_ids, [[token] for token in values[:count]])
+        return pending
 
     def stage_deferred_sampling(self, stream: torch.cuda.Stream, ready: torch.Event) -> DeferredRejection | None:
         pending = getattr(self, "_pending_rejection_rng", None)

@@ -2,11 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Exercise mixed RAS trajectories and generator ownership on CUDA."""
 
-import os
-import subprocess
-import sys
-import textwrap
-
 import pytest
 import torch
 
@@ -35,48 +30,60 @@ def test_mixed_ras_cuda_trajectories(parameters, seeded_rows, use_host_params):
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-def test_invalid_logits_invalidate_isolated_cuda_context():
-    # A device assert poisons its process's CUDA context, so isolate the failure.
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            textwrap.dedent("""
-                import torch
-                from tests.model_executor.models.cosyvoice3.test_cosyvoice3_model_helpers import (
-                    _make_sampling_metadata, _make_talker_model,
-                )
+@pytest.mark.parametrize("async_output", [False, True])
+@pytest.mark.parametrize("history", [False, True])
+def test_invalid_logits_are_request_local_at_token_consumption(async_output, history):
+    from types import SimpleNamespace
 
-                metadata = _make_sampling_metadata(output_token_ids=[[]])
-                for name in ("temperature", "top_p", "top_k", "frequency_penalties",
-                             "presence_penalties", "repetition_penalties"):
-                    setattr(metadata, name, getattr(metadata, name).cuda())
-                try:
-                    _make_talker_model().sample(torch.full((1, 3), float("nan"), device="cuda"), metadata)
-                    torch.accelerator.synchronize()
-                except RuntimeError as error:
-                    assert "device-side assert" in str(error).lower(), str(error)
-                else:
-                    raise AssertionError("invalid logits were accepted")
+    from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput
 
-                try:
-                    torch.ones(1, device="cuda")
-                    torch.accelerator.synchronize()
-                except RuntimeError as error:
-                    assert "device-side assert" in str(error).lower(), str(error)
-                    print("CUDA_CONTEXT_INVALIDATED")
-                else:
-                    raise AssertionError("device assertion unexpectedly left the context usable")
-            """),
-        ],
-        env={**os.environ, "CUDA_LAUNCH_BLOCKING": "0"},
-        capture_output=True,
-        text=True,
-        timeout=180,
+    from tests.model_executor.models.cosyvoice3.test_cosyvoice3_model_helpers import (
+        _make_sampling_metadata,
+        _make_talker_model,
     )
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "no finite logits" in result.stderr
-    assert "CUDA_CONTEXT_INVALIDATED" in result.stdout
+    from vllm_omni.worker.gpu_ar_model_runner import _SamplingFeedbackOutput
+
+    model = _make_talker_model()
+    metadata = _make_sampling_metadata(output_token_ids=[[0] * 10 if history else [], []])
+    for name in ("temperature", "top_p", "top_k", "frequency_penalties", "presence_penalties", "repetition_penalties"):
+        setattr(metadata, name, getattr(metadata, name).cuda())
+    metadata.generators = {row: torch.Generator(device="cuda").manual_seed(42 + row) for row in range(2)}
+    good_state = metadata.generators[1].get_state()
+    logits = torch.tensor([[float("nan")] * 6761, [0.0] * 6761], device="cuda")
+    with pytest.raises(ValueError, match="no finite logits"):
+        model.sample(logits.clone(), metadata)
+    output = model.sample(logits.clone(), metadata, defer_rng=True)
+    if async_output:
+        stream = torch.cuda.Stream()
+        wrapped = AsyncGPUModelRunnerOutput(
+            model_runner_output=SimpleNamespace(req_ids=["bad", "good"]),
+            sampled_token_ids=output.sampled_token_ids,
+            logprobs_tensors=None,
+            invalid_req_indices=[],
+            async_output_copy_stream=stream,
+            vocab_size=6761,
+        )
+        feedback = model.stage_deferred_sampling(stream, wrapped.async_copy_ready_event)
+        result = _SamplingFeedbackOutput(wrapped, feedback).get_output()
+        assert result.invalid_logits_req_ids == {"bad"}
+    else:
+        feedback = model.finalize_deferred_sampling(output.sampled_token_ids)
+    assert feedback.invalid_rows() == [0]
+    actual_good = output.sampled_token_ids[1].item()
+    actual_state = metadata.generators[1].get_state()
+    model.commit_deferred_sampling()
+
+    # The healthy row still follows the original sampling and RNG behavior.
+    metadata.generators[1].set_state(good_state)
+    reference_metadata = _make_sampling_metadata(output_token_ids=[[]])
+    for name in ("temperature", "top_p", "top_k", "frequency_penalties", "presence_penalties", "repetition_penalties"):
+        setattr(reference_metadata, name, getattr(reference_metadata, name).cuda())
+    reference_metadata.generators = {0: metadata.generators[1]}
+    expected = model.sample(logits[1:].clone(), reference_metadata)
+    assert actual_good == expected.sampled_token_ids.item()
+    assert torch.equal(actual_state, metadata.generators[1].get_state())
+    # No device assert: subsequent CUDA work remains usable.
+    assert (torch.ones(1, device="cuda") + 1).item() == 2
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
@@ -224,11 +231,8 @@ def test_async_feedback_commits_rng_once_at_token_consumption(consumer):
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("vocab", [2049, 6761, 8193, 9216])
-def test_rejected_probability_preparation_matches_aten_bits(vocab):
-    from vllm.triton_utils import triton
-
-    from vllm_omni.model_executor.models.cosyvoice3.v1_sampling import _prepare_replacement_kernel
-    from vllm_omni.utils.seeded_exponential import torch_exponential_policy
+def test_fused_replacement_matches_native_tokens_and_rng(vocab):
+    from vllm_omni.model_executor.models.cosyvoice3.v1_sampling import commit_rejection_rng, conditional_sample
 
     scores = torch.sin(torch.arange(5 * vocab, device="cuda").reshape(5, vocab).float())
     scores[1].zero_()
@@ -236,36 +240,28 @@ def test_rejected_probability_preparation_matches_aten_bits(vocab):
     scores[3].fill_(-float("inf"))
     scores[3, 3] = 0
     picked = torch.arange(5, device="cuda")
-    rejected = torch.tensor([True, True, True, True, False], device="cuda")
-    snapshots = torch.zeros((5, 4), dtype=torch.int64, device="cuda")
-    plan = torch.empty((5, 4), dtype=torch.int64, device="cuda")
-    probs = torch.full_like(scores, float("nan"))
-    threads, increment = torch_exponential_policy(vocab, scores.device)
-    props = torch.cuda.get_device_properties(scores.device)
-    _prepare_replacement_kernel[(5,)](
-        rejected,
-        snapshots,
-        plan,
-        scores,
-        picked,
-        probs,
-        True,
-        triton.next_power_of_2(vocab),
-        5,
-        vocab,
-        8,
-        threads,
-        increment,
-        props.multi_processor_count * (props.max_threads_per_multi_processor // 256) * 256,
-        num_warps=32,
-        enable_fp_fusion=False,
-    )
+    flags = [True, True, True, True, False]
+    generators = {row: torch.Generator(device=scores.device).manual_seed(42 + row) for row in range(5)}
+    before = {row: g.get_state().clone() for row, g in generators.items()}
+    actual = conditional_sample(scores, picked.clone(), torch.tensor(flags, device="cuda"), generators)
+    assert all(torch.equal(g.get_state(), before[row]) for row, g in generators.items())
+    commit_rejection_rng(flags, generators, vocab, scores.device)
+    actual_states = {row: g.get_state().clone() for row, g in generators.items()}
+    for row, g in generators.items():
+        g.set_state(before[row])
+
     # Independent ATen oracle, including the sole-finite-candidate fallback.
-    masked = scores.clone()
-    selected = masked.gather(1, picked[:, None])
-    masked.scatter_(1, picked[:, None], -float("inf"))
-    masked.scatter_(
-        1, picked[:, None], torch.where(torch.isfinite(masked).any(1, keepdim=True), -float("inf"), selected)
+    logits = scores[:4].clone()
+    selected = logits.gather(1, picked[:4, None])
+    logits.scatter_(1, picked[:4, None], -float("inf"))
+    logits.scatter_(
+        1, picked[:4, None], torch.where(torch.isfinite(logits).any(1, keepdim=True), -float("inf"), selected)
     )
-    assert torch.equal(probs[:4], masked.softmax(1)[:4])
-    assert torch.isnan(probs[4]).all()  # Accepted rows never prepare probabilities.
+    probs = logits.softmax(1)
+    noise = torch.empty_like(probs)
+    for row in range(4):
+        noise[row].exponential_(generator=generators[row])
+    expected = picked.clone()
+    expected[:4] = (probs / noise).argmax(1)
+    assert torch.equal(actual, expected)  # Accepted row keeps its original token.
+    assert all(torch.equal(g.get_state(), actual_states[row]) for row, g in generators.items())

@@ -206,7 +206,6 @@ def _prepare_replacement_kernel(
     plan,
     scores,
     sampled,
-    probs,
     prepare_probs: tl.constexpr,
     vocab_block: tl.constexpr,
     rows: tl.constexpr,
@@ -236,10 +235,9 @@ def _prepare_replacement_kernel(
     if is_seeded:
         preceding = tl.sum((active & (seeded != 0) & (groups == group) & (positions < row)).to(tl.int32), 0)
         offset += preceding * row_increment + tl.where((group == 0) & uses_default, batch_increment, 0)
-    tl.store(plan + row * 4, tl.load(snapshots + row * 4))
-    tl.store(plan + row * 4 + 1, offset)
-    tl.store(plan + row * 4 + 2, tl.where(is_seeded, row_threads, batch_threads))
-    tl.store(plan + row * 4 + 3, tl.where(is_seeded, 0, rank * vocab))
+    seed = tl.load(snapshots + row * 4).to(tl.uint64)
+    threads = tl.where(is_seeded, row_threads, batch_threads)
+    start = tl.where(is_seeded, 0, rank * vocab)
 
     if prepare_probs:
         cols = tl.arange(0, vocab_block)
@@ -260,7 +258,14 @@ def _prepare_replacement_kernel(
             partial = partial + tl.where(positions < vocab, term, 0.0)
         denominator = tl.sum(partial, 0)
         weights = tl.div_rn(tl.extra.cuda.libdevice.exp(values - maximum), denominator)
-        tl.store(probs + row * vocab + cols, weights, cols < vocab)
+        noise = torch_exponential_noise(seed, offset.to(tl.uint64), start + cols, threads)
+        draws = tl.where(cols < vocab, tl.div_rn(weights, noise), -float("inf"))
+        tl.store(sampled + row, tl.argmax(draws, axis=0, tie_break_left=True))
+    else:
+        tl.store(plan + row * 4, seed)
+        tl.store(plan + row * 4 + 1, offset)
+        tl.store(plan + row * 4 + 2, threads)
+        tl.store(plan + row * 4 + 3, start)
 
 
 def conditional_sample(
@@ -287,19 +292,17 @@ def conditional_sample(
             (seed if seed < 1 << 63 else seed - (1 << 64), generator.get_offset(), group, row in generators)
         )
     state = torch.tensor(snapshots, dtype=torch.int64, pin_memory=True).to(scores.device, non_blocking=True)
-    plan = torch.empty((rows, 4), dtype=torch.int64, device=scores.device)
     row_threads, row_increment = torch_exponential_policy(vocab, scores.device)
     props = torch.cuda.get_device_properties(scores.device)
     # Match ATen's register softmax branch. Other vocabulary sizes retain ATen.
     prepare_probs = 2048 < vocab <= 9216
-    probs = torch.empty_like(scores) if prepare_probs else None
+    plan = None if prepare_probs else torch.empty((rows, 4), dtype=torch.int64, device=scores.device)
     _prepare_replacement_kernel[(rows,)](
         rejected,
         state,
         plan,
         scores,
         sampled,
-        probs,
         prepare_probs,
         triton.next_power_of_2(vocab),
         rows,
@@ -311,14 +314,15 @@ def conditional_sample(
         num_warps=32 if prepare_probs else 4,
         enable_fp_fusion=False,
     )
-    if not prepare_probs:
-        # Preserve ATen outside the verified register-softmax branch.
-        scores = scores.clone()
-        ids = sampled.unsqueeze(1)
-        selected = scores.gather(1, ids)
-        scores.scatter_(1, ids, float("-inf"))
-        scores.scatter_(1, ids, torch.where(torch.isfinite(scores).any(1, keepdim=True), float("-inf"), selected))
-        probs = scores.softmax(1)
+    if prepare_probs:
+        return sampled
+    # Preserve ATen outside the verified register-softmax branch.
+    scores = scores.clone()
+    ids = sampled.unsqueeze(1)
+    selected = scores.gather(1, ids)
+    scores.scatter_(1, ids, float("-inf"))
+    scores.scatter_(1, ids, torch.where(torch.isfinite(scores).any(1, keepdim=True), float("-inf"), selected))
+    probs = scores.softmax(1)
     _categorical_kernel[(rows,)](
         probs,
         None,
@@ -382,14 +386,30 @@ class DeferredRejection:
         self.ready: torch.Event | None = None
         self._lock = Lock()
         self._committed = False
+        self.invalid_logits: torch.Tensor | None = None
+
+    def flags(self) -> torch.Tensor:
+        if self.invalid_logits is None:
+            return self.rejected
+        return torch.cat((self.rejected, self.invalid_logits))
+
+    def invalid_rows(self) -> list[int]:
+        """Read only after the shared token completion event has finished."""
+        if self.invalid_logits is None:
+            return []
+        assert self.host is not None
+        return [row for row, invalid in enumerate(self.host[self.rejected.numel() :].tolist()) if invalid]
 
     def stage(self, stream: torch.cuda.Stream, ready: torch.Event) -> None:
         # Token copies are already queued on this stream. Extend their existing
         # event to cover flags, without waiting or changing token allocation.
-        self.host = torch.empty(self.rejected.shape, dtype=self.rejected.dtype, pin_memory=True)
+        flags = self.flags()
+        stream.wait_stream(torch.cuda.current_stream())
+        self.host = torch.empty(flags.shape, dtype=flags.dtype, pin_memory=True)
         self.ready = ready
         with torch.cuda.stream(stream):
-            self.host.copy_(self.rejected, non_blocking=True)
+            self.host.copy_(flags, non_blocking=True)
+            flags.record_stream(stream)
             ready.record()
 
     def commit(self, *, ready: bool = False) -> None:
@@ -401,5 +421,7 @@ class DeferredRejection:
             # no token-history dependency still must commit before reusing RNG.
             if not ready and not self.ready.query():
                 self.ready.synchronize()
-            commit_rejection_rng(self.host.tolist(), self.generators, self.vocab, self.rejected.device)
+            commit_rejection_rng(
+                self.host[: self.rejected.numel()].tolist(), self.generators, self.vocab, self.rejected.device
+            )
             self._committed = True

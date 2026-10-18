@@ -207,6 +207,7 @@ class _SamplingFeedbackOutput(AsyncModelRunnerOutput):
     def get_output(self) -> OmniModelRunnerOutput:
         output = self.output.get_output()
         self.feedback.commit(ready=True)
+        output.invalid_logits_req_ids = {output.req_ids[row] for row in self.feedback.invalid_rows()}
         return output
 
 
@@ -2081,8 +2082,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
         # Commit conditional RNG before bookkeeping can roll back discarded draws.
         finalize_sampling = getattr(getattr(self, "model", None), "finalize_deferred_sampling", None)
+        sampling_feedback = None
         if not self.use_async_scheduling and callable(finalize_sampling):
-            finalize_sampling(sampler_output.sampled_token_ids)
+            sampling_feedback = finalize_sampling(sampler_output.sampled_token_ids)
         self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
         if self.use_async_scheduling:
             pp = get_pp_group()
@@ -2287,6 +2289,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     prefix_cache_step_id=prefix_cache_step_id,
                 )
             output.omni_connector_output = omni_connector_output
+            if sampling_feedback is not None:
+                output.invalid_logits_req_ids = {req_ids_output_copy[row] for row in sampling_feedback.invalid_rows()}
             return output
 
         if not use_async_omni_output:

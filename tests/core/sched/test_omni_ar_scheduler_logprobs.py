@@ -249,7 +249,8 @@ def test_mid_step_stop_trims_logprob_rows_with_token_ids() -> None:
     np.testing.assert_array_equal(token_rows[:, 0], [7])
 
 
-def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
+@pytest.mark.parametrize("failure", ["logprobs", "logits"])
+def test_invalid_sampling_finishes_only_the_affected_scheduler_request(failure) -> None:
     """A bad runner response must not bring down unrelated batch requests."""
     bad = _Request("bad")
     good = _Request("good")
@@ -269,6 +270,7 @@ def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
     )
     model_runner_output = SimpleNamespace(
         sampled_token_ids=[[7], [8]],
+        invalid_logits_req_ids={"bad"} if failure == "logits" else set(),
         logprobs=_logprobs(
             [[9, 1], [8, 2]],
             [[-0.9, -1.0], [-0.8, -1.0]],
@@ -288,7 +290,8 @@ def test_invalid_logprobs_finish_only_the_affected_scheduler_request() -> None:
 
     assert update_calls == ["good"]
     assert bad.status is RequestStatus.FINISHED_ERROR
-    assert bad.stop_reason is not None and "misaligned" in bad.stop_reason
+    assert bad.stop_reason is not None
+    assert ("no finite logits" if failure == "logits" else "misaligned") in bad.stop_reason
     assert "bad" not in scheduler.requests
     assert output_by_id["bad"].finish_reason is FinishReason.ERROR
     assert output_by_id["bad"].new_token_ids == []
