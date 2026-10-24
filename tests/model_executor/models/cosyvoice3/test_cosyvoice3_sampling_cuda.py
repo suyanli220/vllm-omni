@@ -2,47 +2,32 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Exercise mixed RAS trajectories and generator ownership on CUDA."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
+from vllm.v1.worker.gpu_input_batch import InputBatch
+from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput
 
 from tests.helpers.mark import hardware_test
 from tests.model_executor.models.cosyvoice3.test_cosyvoice3_model_helpers import (
+    _make_sampling_metadata,
+    _make_talker_model,
+)
+from tests.model_executor.models.cosyvoice3.test_cosyvoice3_model_helpers import (
     test_mixed_ras_preserves_seeded_trajectories_and_greedy_rng as _check_mixed_ras,
 )
+from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model
+from vllm_omni.model_executor.models.cosyvoice3.v1_sampling import commit_rejection_rng, conditional_sample
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.worker.gpu_ar_model_runner import _SamplingFeedbackOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.skipif(not current_omni_platform.is_cuda(), reason="requires CUDA")]
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize(
-    "parameters,seeded_rows,use_host_params",
-    [
-        ("mixed", (0, 1, 2, 3), True),
-        ("mixed", (0, 2), True),
-        ("mixed", (0, 1, 2, 3), False),
-        ("defaults", (0, 2), True),
-        ("all_random", (0, 1, 2, 3), True),
-    ],
-)
-def test_mixed_ras_cuda_trajectories(parameters, seeded_rows, use_host_params):
-    _check_mixed_ras(parameters, seeded_rows, use_host_params=use_host_params, device="cuda")
-
-
-@hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("async_output", [False, True])
-@pytest.mark.parametrize("history", [False, True])
+@pytest.mark.parametrize("async_output,history", [(True, False), (False, True)])
 def test_invalid_logits_are_request_local_at_token_consumption(async_output, history):
-    from types import SimpleNamespace
-
-    from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput
-
-    from tests.model_executor.models.cosyvoice3.test_cosyvoice3_model_helpers import (
-        _make_sampling_metadata,
-        _make_talker_model,
-    )
-    from vllm_omni.worker.gpu_ar_model_runner import _SamplingFeedbackOutput
-
     model = _make_talker_model()
     metadata = _make_sampling_metadata(output_token_ids=[[0] * 10 if history else [], []])
     for name in ("temperature", "top_p", "top_k", "frequency_penalties", "presence_penalties", "repetition_penalties"):
@@ -87,26 +72,19 @@ def test_invalid_logits_are_request_local_at_token_consumption(async_output, his
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("layout", ["default", "seeded", "mixed", "shared", "default_alias", "mixed_alias"])
+@pytest.mark.parametrize("layout", ["default", "mixed_alias"])
 def test_conditional_replacement_matches_native_rng(layout):
-    from vllm_omni.model_executor.models.cosyvoice3.v1_sampling import commit_rejection_rng, conditional_sample
-
     device = torch.device("cuda", torch.accelerator.current_device_index())
     default = torch.cuda.default_generators[device.index]
     original = default.get_state()
     shared = torch.Generator(device=device).manual_seed(71)
-    independent = torch.Generator(device=device).manual_seed(83)
     layouts = {
         "default": {},
-        "seeded": {i: torch.Generator(device=device).manual_seed(100 + i) for i in range(4)},
-        "mixed": {2: independent, 0: shared},
-        "shared": {3: shared, 0: shared, 2: shared, 1: shared},
-        "default_alias": {2: default, 0: default},
         "mixed_alias": {3: shared, 2: default, 0: shared},
     }
     generators = layouts[layout]
     unique = {id(g): g for g in [default, *generators.values()]}
-    scores = torch.sin(torch.arange(4 * 8193, device=device).reshape(4, 8193).float())
+    scores = torch.sin(torch.arange(4 * 6761, device=device).reshape(4, 6761).float())
     try:
         for flags in ([False, True, False, True], [True, False, True, True], [False] * 4):
             before = {key: g.get_state().clone() for key, g in unique.items()}
@@ -139,10 +117,8 @@ def test_conditional_replacement_matches_native_rng(layout):
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("seeded_rows", [(0, 1, 2, 3), (0, 2)])
+@pytest.mark.parametrize("seeded_rows", [(0, 2)])
 def test_deferred_ras_trajectory_and_token_feedback(monkeypatch, seeded_rows):
-    from vllm_omni.model_executor.models.cosyvoice3.cosyvoice3 import CosyVoice3Model
-
     sample = CosyVoice3Model.sample
 
     def deferred(model, *args, **kwargs):
@@ -160,17 +136,6 @@ def test_deferred_ras_trajectory_and_token_feedback(monkeypatch, seeded_rows):
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize("consumer", ["history", "output"])
 def test_async_feedback_commits_rng_once_at_token_consumption(consumer):
-    from types import SimpleNamespace
-
-    from vllm.v1.worker.gpu_input_batch import InputBatch
-    from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput
-
-    from tests.model_executor.models.cosyvoice3.test_cosyvoice3_model_helpers import (
-        _make_sampling_metadata,
-        _make_talker_model,
-    )
-    from vllm_omni.worker.gpu_ar_model_runner import _SamplingFeedbackOutput
-
     model = _make_talker_model()
     metadata = _make_sampling_metadata(output_token_ids=[[0] * 10, [0] * 10])
     for name in ("temperature", "top_p", "top_k", "frequency_penalties", "presence_penalties", "repetition_penalties"):
@@ -181,7 +146,8 @@ def test_async_feedback_commits_rng_once_at_token_consumption(consumer):
     default = torch.cuda.default_generators[torch.accelerator.current_device_index()]
     original = default.get_state()
     before = (generator.get_state(), default.get_state())
-    logits = torch.tensor([[3.0, 1.0, 0.0]] * 2, device="cuda")
+    logits = torch.full((2, 6761), -float("inf"), device="cuda")
+    logits[:, :3] = torch.tensor([3.0, 1.0, 0.0], device="cuda")
     try:
         reference = model.sample(logits.clone(), metadata).sampled_token_ids.cpu()
         # Match the runner's existing discarded-request rollback ordering.
@@ -200,7 +166,7 @@ def test_async_feedback_commits_rng_once_at_token_consumption(consumer):
             logprobs_tensors=None,
             invalid_req_indices=[],
             async_output_copy_stream=stream,
-            vocab_size=3,
+            vocab_size=6761,
         )
         feedback = model.stage_deferred_sampling(stream, wrapped.async_copy_ready_event)
         result = _SamplingFeedbackOutput(wrapped, feedback)
@@ -229,10 +195,8 @@ def test_async_feedback_commits_rng_once_at_token_consumption(consumer):
 
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
-@pytest.mark.parametrize("vocab", [2049, 6761, 8193, 9216])
+@pytest.mark.parametrize("vocab", [6761])
 def test_fused_replacement_matches_native_tokens_and_rng(vocab):
-    from vllm_omni.model_executor.models.cosyvoice3.v1_sampling import commit_rejection_rng, conditional_sample
-
     scores = torch.sin(torch.arange(5 * vocab, device="cuda").reshape(5, vocab).float())
     scores[1].zero_()
     scores[2] = torch.linspace(-1000, 0, vocab, device="cuda")

@@ -12,7 +12,7 @@ from threading import Lock
 
 import torch
 from vllm.triton_utils import tl, triton
-from vllm.v1.sample.ops.topk_topp_sampler import random_sample
+from vllm.v1.sample.ops import topk_topp_sampler
 
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.seeded_exponential import torch_exponential_noise, torch_exponential_policy
@@ -37,8 +37,8 @@ def _categorical_kernel(
     nucleus: tl.constexpr,
     vocab: tl.constexpr,
     stride: tl.constexpr,
-    row_threads: tl.constexpr,
-    batch_threads: tl.constexpr,
+    row_threads,
+    batch_threads,
     block: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -165,7 +165,7 @@ def _use_triton(probs: torch.Tensor) -> bool:
 def categorical_sample(probs: torch.Tensor, generators: dict[int, torch.Generator]) -> torch.Tensor:
     """Return an int64 token vector; replacements supply only rejected rows."""
     if not _use_triton(probs):
-        return random_sample(probs, generators).reshape(-1).long()
+        return topk_topp_sampler.random_sample(probs, generators).reshape(-1).long()
     return _cuda_sample(probs, generators)[0]
 
 
@@ -191,7 +191,7 @@ def nucleus_sample(
     keep = (cumulative - probs) < top_p.unsqueeze(1)
     ranks = torch.arange(probs.shape[1], device=probs.device)
     keep &= (top_k.unsqueeze(1) <= 0) | (ranks.unsqueeze(0) < top_k.unsqueeze(1))
-    draws = random_sample(probs * keep.to(probs.dtype), generators).reshape(-1, 1).long()
+    draws = topk_topp_sampler.random_sample(probs * keep.to(probs.dtype), generators).reshape(-1, 1).long()
     sampled = indices.gather(1, draws).squeeze(1)
     repeated = None
     if history is not None:
@@ -208,7 +208,7 @@ def _prepare_replacement_kernel(
     sampled,
     prepare_probs: tl.constexpr,
     vocab_block: tl.constexpr,
-    rows: tl.constexpr,
+    rows,
     vocab: tl.constexpr,
     block: tl.constexpr,
     row_threads: tl.constexpr,
@@ -307,7 +307,7 @@ def conditional_sample(
         triton.next_power_of_2(vocab),
         rows,
         vocab,
-        triton.next_power_of_2(rows),
+        64,
         row_threads,
         row_increment,
         props.multi_processor_count * (props.max_threads_per_multi_processor // 256) * 256,

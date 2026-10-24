@@ -776,6 +776,7 @@ class CosyVoice3Model(
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
+        self._pending_rejection_rng: DeferredRejection | None = None
         self.config = vllm_config.model_config.hf_config
         standard_sampling = cosyvoice3_standard_sampling(self.config)
         logger.info("CosyVoice3 sampling policy: %s", "standard" if standard_sampling else "ras")
@@ -1104,7 +1105,7 @@ class CosyVoice3Model(
             defer_rng=defer_rng,
         )
         if defer_rng and logits.is_cuda:
-            pending = getattr(self, "_pending_rejection_rng", None)
+            pending = self._pending_rejection_rng
             if pending is None:
                 pending = DeferredRejection(torch.empty(0, dtype=torch.bool, device=logits.device), {}, logits.shape[1])
                 self._pending_rejection_rng = pending
@@ -1113,7 +1114,7 @@ class CosyVoice3Model(
 
     def finalize_deferred_sampling(self, sampled_token_ids: torch.Tensor) -> DeferredRejection | None:
         """Share one feedback copy/wait for tokens and conditional RNG commits."""
-        pending = getattr(self, "_pending_rejection_rng", None)
+        pending = self._pending_rejection_rng
         if pending is None:
             return
         payload = torch.cat((sampled_token_ids.reshape(-1), pending.flags().to(sampled_token_ids.dtype)))
@@ -1132,13 +1133,13 @@ class CosyVoice3Model(
         return pending
 
     def stage_deferred_sampling(self, stream: torch.cuda.Stream, ready: torch.Event) -> DeferredRejection | None:
-        pending = getattr(self, "_pending_rejection_rng", None)
+        pending = self._pending_rejection_rng
         if pending is not None:
             pending.stage(stream, ready)
         return pending
 
     def commit_deferred_sampling(self) -> None:
-        pending = getattr(self, "_pending_rejection_rng", None)
+        pending = self._pending_rejection_rng
         if pending is not None:
             pending.commit()
             self._pending_rejection_rng = None

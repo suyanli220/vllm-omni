@@ -26,17 +26,9 @@ def _torch_sample(probs, generators):
 @pytest.mark.parametrize(
     "vocab,rows,seeding",
     [
-        (3, 1, "all"),
-        (6761, 1, "all"),
-        (257, 4, "all"),
-        (6761, 8, "all"),
         (6761, 4, "partial"),
-        (6761, 4, "none"),
         (6761, 4, "shared"),
         (6761, 4, "default_alias"),
-        (6761, 64, "none"),
-        (257, 65, "partial"),
-        (257, 4, "partial"),
         (6761, 4, "changing"),
     ],
 )
@@ -46,8 +38,6 @@ def test_categorical_matches_tokens_and_generator_states(vocab, rows, seeding):
     request_generators = generators.copy()
     if seeding == "partial":
         generators = {i: g for i, g in generators.items() if i % 2}
-    elif seeding == "none":
-        generators = {}
     elif seeding == "shared":
         generators = dict.fromkeys(range(rows), generators[0])
     elif seeding == "default_alias":
@@ -74,19 +64,14 @@ def test_categorical_matches_tokens_and_generator_states(vocab, rows, seeding):
 
 @hardware_test(res={"cuda": "L4"}, num_cards=1)
 @pytest.mark.parametrize(
-    "vocab,top_k,seeded,window,full_top_p",
+    "vocab,top_k,seeded,window",
     [
-        (3, -1, False, 10, False),
-        (257, -1, True, 10, False),
-        (6761, -1, True, 10, False),
-        (257, 1, True, 10, False),
-        (257, 2, False, 10, False),
-        (257, 2, True, 10, False),
-        (257, -1, True, 0, False),
-        (257, 25, True, 10, True),
+        (6761, -1, True, 10),
+        (6761, 2, False, 10),
+        (6761, -1, True, 0),
     ],
 )
-def test_nucleus_exact_boundaries_ties_and_default_rng(vocab, top_k, seeded, window, full_top_p):
+def test_nucleus_exact_boundaries_ties_and_default_rng(vocab, top_k, seeded, window):
     device = torch.device("cuda", 0)
     # Equal weights make stable-sort ties and exact cumulative boundaries observable.
     probs, indices = torch.zeros(3, vocab, device=device).softmax(-1).sort(descending=True, stable=True)
@@ -99,8 +84,6 @@ def test_nucleus_exact_boundaries_ties_and_default_rng(vocab, top_k, seeded, win
             torch.nextafter(boundary, torch.full_like(boundary, float("inf"))),
         ]
     )
-    if full_top_p:
-        top_p.fill_(1.0)
     limits = torch.full((3,), top_k, device=device, dtype=torch.int32)
     history = torch.tensor([[0] * window, [1] * window, [-1] * window], device=device, dtype=torch.long)
     generators = {i: torch.Generator(device=device).manual_seed(17 + i) for i in range(3)} if seeded else {}

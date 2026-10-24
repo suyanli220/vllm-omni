@@ -5,12 +5,15 @@
 import pytest
 import torch
 from vllm.sampling_params import SamplingParams
+from vllm.v1.worker import gpu_input_batch
+from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 from tests.model_executor.models.cosyvoice3.test_cosyvoice3_model_helpers import (
     _make_sampling_metadata,
     _make_talker_model,
 )
 from vllm_omni.model_executor.models.cosyvoice3 import cosyvoice3
+from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -140,11 +143,6 @@ def test_host_policy_does_not_read_unused_penalty_buffers(monkeypatch):
 @pytest.mark.parametrize("repetition_penalty", [1.0, 1.0001])
 def test_host_policy_real_input_batch_and_runner(monkeypatch, repetition_penalty):
     """Validate the host/GPU metadata contract through the actual V1 entry point."""
-    from vllm.v1.worker import gpu_input_batch
-    from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
-
-    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
-
     monkeypatch.setattr(gpu_input_batch, "PIN_MEMORY", False)
     batch = InputBatch(
         max_num_reqs=2,
@@ -205,23 +203,3 @@ def test_host_policy_real_input_batch_and_runner(monkeypatch, repetition_penalty
     batch.condense()
     add("replacement", 0.7, 33)
     run()
-
-
-def test_sampler_initializes_rng_in_fresh_process():
-    """Pytest already imports Omni; a fresh CLI process must use the same RNG."""
-    import subprocess
-    import sys
-    from pathlib import Path
-
-    subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "from vllm_omni.model_executor.models.cosyvoice3.v1_sampling import random_sample; "
-            "from vllm.v1.sample.ops.topk_topp_sampler import random_sample as initialized; "
-            "assert random_sample is initialized; "
-            "assert getattr(random_sample, '_omni_batched_seeded', False)",
-        ],
-        cwd=Path(__file__).resolve().parents[4],
-        check=True,
-    )

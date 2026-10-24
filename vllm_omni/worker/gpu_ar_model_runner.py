@@ -1393,8 +1393,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         fallthrough is load-bearing, not an error path; it is logged once per
         model for visibility.
         """
-        sampling_metadata = self.input_batch.sampling_metadata
         commit_sampling = getattr(self.model, "commit_deferred_sampling", None)
+        if callable(commit_sampling):
+            commit_sampling()
+        sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
             model_sample = getattr(self.model, "sample", None)
             self.input_batch.update_async_output_token_ids()
@@ -1410,8 +1412,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                         self.input_batch.positions[self.input_batch.logits_indices],
                     )
                 prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(sampling_metadata)
-                if callable(commit_sampling):
-                    commit_sampling()
                 self._apply_duplex_sampling(logits, prepared_sampling_metadata)
                 sampler_output = call_model_sampler(
                     self.model,
@@ -1419,7 +1419,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     logits,
                     prepared_sampling_metadata,
                     input_batch=self.input_batch,
-                    requests=getattr(self, "requests", None),
+                    requests=self.requests,
                     defer_rng=True,
                 )
                 if sampler_output is not None:
@@ -1432,15 +1432,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                     "prefer_model_sampler model %s returned None from sample(); falling back to the default sampler.",
                     type(self.model).__name__,
                 )
-            if callable(commit_sampling):
-                commit_sampling()
             return self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
 
-        if callable(commit_sampling):
-            commit_sampling()
         return super()._sample(logits, spec_decode_metadata)
 
     @staticmethod
@@ -2081,7 +2077,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         # Commit conditional RNG before bookkeeping can roll back discarded draws.
-        finalize_sampling = getattr(getattr(self, "model", None), "finalize_deferred_sampling", None)
+        finalize_sampling = getattr(self.model, "finalize_deferred_sampling", None)
         sampling_feedback = None
         if not self.use_async_scheduling and callable(finalize_sampling):
             sampling_feedback = finalize_sampling(sampler_output.sampled_token_ids)
@@ -2327,7 +2323,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 async_output.async_copy_ready_event,
             )
 
-        stage_sampling = getattr(getattr(self, "model", None), "stage_deferred_sampling", None)
+        stage_sampling = getattr(self.model, "stage_deferred_sampling", None)
         if callable(stage_sampling):
             feedback = stage_sampling(self.async_output_copy_stream, async_output.async_copy_ready_event)
             if feedback is not None:

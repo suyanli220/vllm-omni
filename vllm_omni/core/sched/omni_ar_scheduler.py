@@ -566,7 +566,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             sampling_validation_failed = False
             if req_id in getattr(model_runner_output, "invalid_logits_req_ids", ()):
                 request.status = RequestStatus.FINISHED_ERROR
-                request.stop_reason = "CosyVoice3 sampling received a row with no finite logits"
+                request.stop_reason = "Sampling received a row with no finite logits"
                 request.resumable = False
                 generated_token_ids = []
                 sampling_validation_failed = True

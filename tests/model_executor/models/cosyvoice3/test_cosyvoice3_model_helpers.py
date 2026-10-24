@@ -118,6 +118,7 @@ def _make_code2wav_model(
 def _make_talker_model() -> CosyVoice3Model:
     model = object.__new__(CosyVoice3Model)
     nn.Module.__init__(model)
+    model._pending_rejection_rng = None
     model.model_stage = "cosyvoice3_talker"
     model.config = SimpleNamespace(
         llm={
@@ -740,6 +741,8 @@ def test_batched_ras_matches_serial_seeded_requests_and_rng_state():
 def test_mixed_ras_preserves_seeded_trajectories_and_greedy_rng(parameters, seeded_rows, use_host_params, device="cpu"):
     model = _make_talker_model()
     logits = torch.tensor([[4.0, 1.0, 0.0, -1.0], [0.0, 2.0, 1.0, -2.0]] * 2, device=device)
+    if torch.device(device).type == "cuda":
+        logits = torch.nn.functional.pad(logits, (0, 6761 - logits.shape[1]), value=-float("inf"))
     metadata = _make_sampling_metadata(output_token_ids=[[0] * 10, [1], [], [1] * 10])
     metadata.all_random = parameters == "all_random"
     # Include a greedy row between random rows to exercise both compactions.
@@ -874,6 +877,7 @@ def test_gpu_ar_model_runner_prefers_model_sampler_when_opted_in():
 
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
+    runner.requests = {}
 
     def model_sample(logits, sampling_metadata):
         calls.append(logits.clone())
@@ -914,6 +918,7 @@ def test_gpu_ar_model_runner_supplies_req_output_history_to_model_sampler():
 
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
+    runner.requests = {}
 
     def model_sample(logits, sampling_metadata):
         seen_histories.append([list(x) for x in sampling_metadata.output_token_ids])
@@ -960,6 +965,7 @@ def test_gpu_ar_model_runner_repairs_async_placeholders_for_model_sampler():
 
     runner = object.__new__(GPUARModelRunner)
     runner.input_batch = _DummyInputBatch()
+    runner.requests = {}
 
     def model_sample(logits, sampling_metadata):
         seen_histories.append([list(x) for x in sampling_metadata.output_token_ids])
@@ -1277,3 +1283,52 @@ def test_generation_output_ownership_is_exposed_only_for_owned_codec(stage, owne
     if stage == "cosyvoice3_code2wav":
         model.code2wav = SimpleNamespace(owns_generation_output_storage=owned)
     assert model.owns_generation_output_storage is (stage == "cosyvoice3_code2wav" and owned)
+
+
+@pytest.mark.parametrize(
+    "route,has_commit",
+    [("custom", True), ("decline", True), ("default", True), ("speculative", True), ("default", False)],
+)
+def test_runner_commits_deferred_rng_once_before_sampling(mocker, route, has_commit):
+    events = []
+    expected = object()
+    metadata = SimpleNamespace()
+    runner = object.__new__(GPUARModelRunner)
+    runner.requests = {}
+    runner.input_batch = SimpleNamespace(
+        sampling_metadata=metadata,
+        update_async_output_token_ids=lambda: events.append("history"),
+    )
+
+    def custom(logits, sampling_metadata):
+        events.append("custom")
+        return None if route == "decline" else expected
+
+    runner.model = SimpleNamespace(prefer_model_sampler=route in ("custom", "decline"), sample=custom)
+    if has_commit:
+        runner.model.commit_deferred_sampling = lambda: events.append("commit")
+
+    def fallback(**kwargs):
+        events.append("default")
+        return expected
+
+    def speculative(*args):
+        events.append("speculative")
+        return expected
+
+    runner.sampler = fallback
+    runner._sampling_metadata_for_model_sampler = lambda smd: smd
+    runner._apply_duplex_sampling = lambda *args: events.append("duplex")
+    mocker.patch.object(GPUModelRunner, "_sample", side_effect=speculative)
+    result = runner._sample(torch.zeros(1, 2), object() if route == "speculative" else None)
+    expected_events = ["commit"] if has_commit else []
+    if route == "speculative":
+        expected_events += ["speculative"]
+    else:
+        expected_events += ["history"]
+        if route in ("custom", "decline"):
+            expected_events += ["duplex", "custom"]
+        if route in ("default", "decline"):
+            expected_events += ["default"]
+    assert result is expected
+    assert events == expected_events
