@@ -199,7 +199,7 @@ def nucleus_sample(
     return sampled, repeated
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows"])
 def _prepare_replacement_kernel(
     rejected,
     snapshots,
